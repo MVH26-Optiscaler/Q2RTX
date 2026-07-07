@@ -21,6 +21,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "vk_util.h"
 #include "refresh/images.h"
 #include "device_memory_allocator.h"
+#ifdef _WIN32
+#include <malloc.h> // alloca() -- MSVC ARM64 needs this in scope for it to resolve as an intrinsic
+#endif
 
 #include <assert.h>
 

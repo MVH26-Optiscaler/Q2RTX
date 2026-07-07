@@ -9,6 +9,10 @@ game*.so
 *.swp
 build*/
 shader_vkpt
+CMakeCache.txt
+# Locally-generated ARM64 Vulkan loader import lib (see src/CMakeLists.txt) --
+# not an official SDK artifact, don't commit it.
+/arm64/
 *.exe
 *.ilk
 *.pdb
@@ -47,3 +51,4 @@ baseq2/**/*.txt
 !baseq2/*.txt
 !baseq2/maps/sky/*.txt
 !baseq2/pics/flashlight_profile.png
+baseq2/models/
