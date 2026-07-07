@@ -100,6 +100,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	SHADER_MODULE_DO(QVK_MOD_FSR_EASU_FP32_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP16_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP32_COMP)                     \
+	SHADER_MODULE_DO(QVK_MOD_UPSCALER_PACK_COMP)                     \
+	SHADER_MODULE_DO(QVK_MOD_UPSCALER_UNPACK_COMP)                   \
 	SHADER_MODULE_DO(QVK_MOD_NORMALIZE_NORMAL_MAP_COMP)              \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_FRAG)                        \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_VERT)                        \
@@ -494,6 +496,9 @@ void create_orthographic_matrix(mat4_t matrix, float xmin, float xmax,
 	PROFILER_DO(FSR,                        1) \
 	PROFILER_DO(FSR_EASU,                   2) \
 	PROFILER_DO(FSR_RCAS,                   2) \
+	PROFILER_DO(UPSCALER,                   1) \
+	PROFILER_DO(UPSCALER_PACK,              2) \
+	PROFILER_DO(UPSCALER_UNPACK,            2) \
 	PROFILER_DO(UPDATE_ENVIRONMENT,         1) \
 	PROFILER_DO(GOD_RAYS,                   1) \
 	PROFILER_DO(GOD_RAYS_REFLECT_REFRACT,   1) \
@@ -699,6 +704,18 @@ bool vkpt_fsr_needs_upscale(void);
 void vkpt_fsr_update_ubo(QVKUniformBuffer_t *ubo);
 VkResult vkpt_fsr_do(VkCommandBuffer cmd_buf);
 VkResult vkpt_fsr_final_blit(VkCommandBuffer cmd_buf, bool warp);
+
+void vkpt_upscaler_init_cvars(void);
+VkResult vkpt_upscaler_initialize(void);
+VkResult vkpt_upscaler_destroy(void);
+VkResult vkpt_upscaler_create_pipelines(void);
+VkResult vkpt_upscaler_destroy_pipelines(void);
+bool vkpt_upscaler_is_enabled(void);
+VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
+// Must be called after the command buffer holding vkpt_upscaler_do()'s pack
+// dispatch has been submitted, and before vkpt_upscaler_final_blit().
+VkResult vkpt_upscaler_run_inference(void);
+VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
 
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);
