@@ -180,6 +180,7 @@ struct
 	size_t         output_byte_size;
 	uint32_t       tile_in;          // input_dims[2..3], validated square
 	uint32_t       tile_out;         // output_dims[2..3], validated square
+	uint32_t       scale;            // tile_out / tile_in, validated integer
 
 	// Render integration.
 	bool                  pipelines_ready;
@@ -202,6 +203,10 @@ struct
 
 	// Set by vkpt_upscaler_do(), consumed by vkpt_upscaler_run_inference().
 	bool             packed_this_frame;
+	// Set once inference has actually filled the output tensor, so the blit can
+	// tell a real result from a frame where the pass bailed and the staging
+	// buffers may not even exist.
+	bool             tensor_valid;
 
 	// One-shot flag set by the upscaler_dump console command, consumed and
 	// cleared by vkpt_upscaler_run_inference().
@@ -461,8 +466,18 @@ static bool validate_tensor_geometry(const char *model_file)
 		return false;
 	}
 
+	// The scale factor drives the render extent (see get_render_extent), and the
+	// unpack pass indexes the output grid as the render target scaled by it, so
+	// it has to be a whole number.
+	if (out[2] % in[2] != 0) {
+		Com_EPrintf("upscaler: %s scale factor %lld -> %lld is not an integer; not loading\n",
+			model_file, (long long)in[2], (long long)out[2]);
+		return false;
+	}
+
 	upscaler.tile_in  = (uint32_t)in[2];
 	upscaler.tile_out = (uint32_t)out[2];
+	upscaler.scale    = upscaler.tile_out / upscaler.tile_in;
 	return true;
 }
 
@@ -486,6 +501,7 @@ static void unload_model(void)
 	upscaler.loaded_model = 0;
 	upscaler.tile_in = 0;
 	upscaler.tile_out = 0;
+	upscaler.scale = 0;
 }
 
 // Loads upscaler_models[index - 1]; index 0 just unloads. Creating the session
@@ -561,17 +577,42 @@ static void load_model(int index)
 		upscaler.tile_in, upscaler.tile_in, upscaler.tile_out, upscaler.tile_out);
 }
 
+// Swaps the model and brings the pipelines back in line with it.
+//
+// The pipelines are normally built during VKPT_INIT_RELOAD_SHADER, which has
+// already run by the time the user picks a model from the menu, and
+// create_pipelines() no-ops when no model is loaded. So a model loaded this
+// late has to rebuild them here; otherwise pipelines_ready stays false and
+// vkpt_upscaler_is_enabled() -- which now also decides the render extent --
+// would not become true until something else happened to reload shaders.
+static void upscaler_load_model_and_pipelines(int index)
+{
+	int was_loaded = upscaler.loaded_model;
+
+	load_model(index);
+
+	// load_model() no-ops before ONNX Runtime is up and when the selection did
+	// not change; either way the pipelines already match.
+	if (upscaler.loaded_model == was_loaded || !qvk.device)
+		return;
+
+	vkpt_upscaler_destroy_pipelines();
+
+	if (upscaler.model_loaded)
+		vkpt_upscaler_create_pipelines();
+}
+
 // flt_upscaler_enable selects the model, so changing it swaps the session.
 // Reached both from the menu, via upscaling_mode_changed(), and from setting
 // flt_upscaler_enable straight from the console.
 static void upscaler_reload_model(void)
 {
-	load_model(cvar_flt_upscaler_enable->integer);
+	upscaler_load_model_and_pipelines(cvar_flt_upscaler_enable->integer);
 }
 
 static void upscaler_model_changed(cvar_t *self)
 {
-	load_model(self->integer);
+	upscaler_load_model_and_pipelines(self->integer);
 }
 
 VkResult vkpt_upscaler_initialize(void)
@@ -871,6 +912,14 @@ bool vkpt_upscaler_is_enabled(void)
 		&& upscaler.pipelines_ready;
 }
 
+// The model's fixed scale factor, or 0 when nothing is going to run. The render
+// extent is derived from this so that the pack pass can copy the render target
+// into the tile grid 1:1 instead of resampling it.
+uint32_t vkpt_upscaler_get_scale(void)
+{
+	return vkpt_upscaler_is_enabled() ? upscaler.scale : 0;
+}
+
 static void bind_upscaler_pipeline(VkCommandBuffer cmd_buf, VkPipeline pipeline)
 {
 	VkDescriptorSet desc_sets[] = {
@@ -893,11 +942,20 @@ static void bind_upscaler_pipeline(VkCommandBuffer cmd_buf, VkPipeline pipeline)
 VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 {
 	upscaler.packed_this_frame = false;
+	upscaler.tensor_valid = false;
 
 	// One tile of model output covers upscaler.tile_out pixels of the final
-	// image; the grid is sized to cover the display extent and the edges are
-	// cropped on unpack. Sizing it from extent_screen_images instead would run
-	// extra inferences for pixels that are never presented.
+	// image, so the grid is sized to cover the display and nothing more --
+	// sizing it from extent_screen_images instead would run extra inferences for
+	// pixels that are never presented.
+	//
+	// The render target is then copied into it 1:1 rather than resampled, which
+	// works out exactly because get_render_extent() sizes the render target at
+	// display / scale: ceil(ceil(W / scale) / tile_in) == ceil(W / tile_out), so
+	// the grid is always just big enough (4x3 tiles at 1080p with a 128 -> 512
+	// model, the last row/column part padding). On a frame where the extents
+	// have not settled yet the two can disagree, and the pack/unpack clamps
+	// degrade that to a crop or an edge smear rather than reading out of bounds.
 	VkExtent2D out = qvk.extent_unscaled;
 	uint32_t tiles_x = (out.width  + upscaler.tile_out - 1) / upscaler.tile_out;
 	uint32_t tiles_y = (out.height + upscaler.tile_out - 1) / upscaler.tile_out;
@@ -961,6 +1019,7 @@ VkResult vkpt_upscaler_run_inference(void)
 	uint32_t num_tiles = upscaler.tiles_x * upscaler.tiles_y;
 	const char *input_names[]  = { UPSCALER_INPUT_NAME };
 	const char *output_names[] = { UPSCALER_OUTPUT_NAME };
+	bool all_tiles_ok = true;
 
 	for (uint32_t tile = 0; tile < num_tiles; tile++)
 	{
@@ -1000,12 +1059,17 @@ VkResult vkpt_upscaler_run_inference(void)
 			Com_EPrintf("upscaler: inference failed on tile %u: %s\n",
 				tile, upscaler.api->GetErrorMessage(status));
 			upscaler.api->ReleaseStatus(status);
+			all_tiles_ok = false;
 			break;
 		}
 
 		if (dump)
 			upscaler_dump_tensor("post", tile, out, upscaler.tile_out);
 	}
+
+	// Only a complete set of tiles is worth unpacking; a partial one would
+	// present whatever the previous frame left in the staging buffer.
+	upscaler.tensor_valid = all_tiles_ok;
 
 	upscaler.inference_ms_accum += Sys_Milliseconds() - time_begin;
 	upscaler.inference_frames++;
@@ -1025,6 +1089,18 @@ VkResult vkpt_upscaler_run_inference(void)
 
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 {
+	// The pass can bail before producing anything -- a failed staging allocation
+	// leaves the buffers destroyed, and a failed inference leaves the tensor
+	// holding the previous frame. Unpacking either would present garbage or read
+	// an already-freed buffer, so fall back to the tone-mapped frame. That is at
+	// render resolution here, hence the filtered blit.
+	if (!upscaler.tensor_valid) {
+		bool needs_filter = qvk.extent_taa_output.width  != qvk.extent_unscaled.width
+		                 || qvk.extent_taa_output.height != qvk.extent_unscaled.height;
+		return vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output,
+			needs_filter, warp);
+	}
+
 	BEGIN_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_UNPACK);
 
 	bind_upscaler_pipeline(cmd_buf, upscaler.pipeline_unpack);
@@ -1072,6 +1148,11 @@ VkResult vkpt_upscaler_destroy_pipelines(void)
 bool vkpt_upscaler_is_enabled(void)
 {
 	return false;
+}
+
+uint32_t vkpt_upscaler_get_scale(void)
+{
+	return 0;
 }
 
 VkResult vkpt_upscaler_run_inference(void)

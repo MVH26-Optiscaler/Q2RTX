@@ -236,8 +236,37 @@ static inline bool extents_equal(VkExtent2D a, VkExtent2D b)
 	return a.width == b.width && a.height == b.height;
 }
 
+static bool is_accumulation_rendering_active(void);
+
+// The NPU upscaler owns the render extent while it runs, so everything that
+// decides whether it runs has to agree on the answer. Accumulation ("photo")
+// mode renders at full resolution over many frames for quality, which is the
+// opposite of what the upscaler is for, so it wins.
+static bool upscaler_owns_render_extent(void)
+{
+	return vkpt_upscaler_get_scale() > 1 && !is_accumulation_rendering_active();
+}
+
 static VkExtent2D get_render_extent(void)
 {
+	if(upscaler_owns_render_extent())
+	{
+		uint32_t upscaler_scale = vkpt_upscaler_get_scale();
+
+		// The NPU upscaler copies the render target into its tile grid 1:1
+		// rather than resampling it, so the model's fixed scale factor dictates
+		// the render extent and viewsize/DRS do not apply. Round up so the
+		// result covers the display; the unpack pass crops the few pixels of
+		// overhang when the display is not an exact multiple of the factor.
+		VkExtent2D result;
+		result.width  = (qvk.extent_unscaled.width  + upscaler_scale - 1) / upscaler_scale;
+		result.height = (qvk.extent_unscaled.height + upscaler_scale - 1) / upscaler_scale;
+
+		result.width = (result.width + 1) & ~1;
+
+		return result;
+	}
+
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -2660,6 +2689,13 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 				qvk.extent_taa_output = qvk.extent_unscaled;
 		}
 	}
+
+	// The NPU upscaler packs the TAA output into its tile grid 1:1 and sized the
+	// render extent for exactly that, so nothing upstream may upsample first.
+	// Unconditional and last: it has to hold whatever flt_taa says, and even if
+	// FSR was also switched on behind flt_upscaling's back.
+	if (upscaler_owns_render_extent())
+		qvk.extent_taa_output = qvk.extent_render;
 }
 
 static void
@@ -2857,11 +2893,12 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
 			ubo->pt_ndf_trim = 1.f;
 		}
 	}
-	else if(fsr_enabled || (qvk.effective_aa_mode == AA_MODE_UPSCALE))
+	else if(fsr_enabled || upscaler_owns_render_extent() || (qvk.effective_aa_mode == AA_MODE_UPSCALE))
 	{
-		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100
-		float resolution_scale = (drs_effective_scale != 0) ? (float)drs_effective_scale : (float)scr_viewsize->integer;
-		resolution_scale *= 0.01f;
+		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100.
+		// Taken from the extents that were actually used rather than from viewsize, which the NPU
+		// upscaler overrides; for the other paths the two are the same value.
+		float resolution_scale = (float)qvk.extent_render.width / (float)qvk.extent_unscaled.width;
 		resolution_scale = Q_clipf(resolution_scale, 0.1f, 1.f);
 		ubo->pt_texture_lod_bias = cvar_pt_texture_lod_bias->value + log2f(resolution_scale);
 	}
@@ -3317,7 +3354,7 @@ R_RenderFrame_RTX(refdef_t *fd)
 
 		// Skip FSR/NPU upscaling if image is going to be heavily blurred anyway (menu mode).
 		// The two are mutually exclusive alternatives for the same upscale-to-display-res step.
-		if (vkpt_upscaler_is_enabled() && !qvk.frame_menu_mode)
+		if (upscaler_owns_render_extent() && !qvk.frame_menu_mode)
 		{
 			vkpt_upscaler_do(post_cmd_buf);
 		}
@@ -3520,13 +3557,32 @@ R_BeginFrame_RTX(void)
 	}
 
 	drs_process();
-	if (vkpt_refdef.fd)
+
+	VkExtent2D extent_render = get_render_extent();
+
+	// Toggling the NPU upscaler changes the render extent by the model's whole
+	// scale factor in one frame, which DRS never does. The tone curve and the
+	// adapted luminance live in the persistent qvk.buf_tonemap and blend towards
+	// the new frame over tm_exposure_speed_* seconds, so a histogram gathered
+	// over the old rect would otherwise drive the exposure for a visible while
+	// after the switch. Reset rather than adapt.
+	if (!extents_equal(extent_render, qvk.extent_render))
 	{
-		vkpt_refdef.fd->feedback.resolution_scale = (drs_effective_scale != 0) ? drs_effective_scale : scr_viewsize->integer;
+		vkpt_tone_mapping_request_reset();
+		vkpt_reset_accumulation();
 	}
 
-	qvk.extent_render = get_render_extent();
+	qvk.extent_render = extent_render;
 	qvk.gpu_slice_width = (qvk.extent_render.width + qvk.device_count - 1) / qvk.device_count;
+
+	if (vkpt_refdef.fd && qvk.extent_unscaled.width)
+	{
+		// Report the scale that was actually rendered at rather than the one that
+		// was asked for; the NPU upscaler overrides both viewsize and DRS, and
+		// this is what scr_fps and cl_resolution_scale show the user.
+		vkpt_refdef.fd->feedback.resolution_scale =
+			qvk.extent_render.width * 100 / qvk.extent_unscaled.width;
+	}
 	
 	VkExtent2D extent_screen_images = get_screen_image_extent();
 
@@ -3614,7 +3670,7 @@ R_EndFrame_RTX(void)
 	if (frame_ready)
 	{
 		bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
-		if (vkpt_upscaler_is_enabled() && !qvk.frame_menu_mode)
+		if (upscaler_owns_render_extent() && !qvk.frame_menu_mode)
 		{
 			vkpt_upscaler_final_blit(cmd_buf, waterwarp);
 		}
@@ -3624,7 +3680,12 @@ R_EndFrame_RTX(void)
 		}
 		else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
 		{
-			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
+			// TAAU normally lands this at display resolution, so an unfiltered
+			// blit is a 1:1 copy. It does not when the NPU upscaler owns the
+			// render extent and then sits out the frame (menu mode), which would
+			// leave a nearest-neighbour upscale of a quarter-resolution image.
+			bool needs_filter = !extents_equal(qvk.extent_taa_output, qvk.extent_unscaled);
+			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, needs_filter, waterwarp);
 		}
 		else
 		{

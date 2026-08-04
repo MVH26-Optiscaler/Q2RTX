@@ -64,12 +64,14 @@ void main()
 	if (any(greaterThanEqual(ipos, out_size)))
 		return;
 
-	// Map the screen pixel into the virtual upscaled tile grid. Nearest
-	// sampling is fine here: the grid is >= the screen and the model has
-	// already done the actual reconstruction.
-	vec2 grid_size = vec2(push.tiles_x * push.tile_out, push.tiles_y * push.tile_out);
-	vec2 uv = (vec2(ipos) + 0.5) / vec2(out_size);
-	ivec2 grid_pos = clamp(ivec2(uv * grid_size), ivec2(0), ivec2(grid_size) - 1);
+	// Pack copied the render target into the tile grid 1:1, so the model output
+	// is the render target scaled by the model's factor and the screen pixel
+	// indexes it 1:1 as well -- no resampling on the way back out either. The
+	// clamp crops the overhang when the display is not an exact multiple of the
+	// scale factor.
+	int scale = int(push.tile_out / push.tile_in);
+	ivec2 valid = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height) * scale;
+	ivec2 grid_pos = min(ipos, valid - 1);
 
 	uint tile_x = uint(grid_pos.x) / push.tile_out;
 	uint tile_y = uint(grid_pos.y) / push.tile_out;

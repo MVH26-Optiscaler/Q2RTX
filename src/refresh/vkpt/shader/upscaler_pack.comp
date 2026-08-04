@@ -19,11 +19,14 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 // ========================================================================== //
 // NPU upscaler, pack pass.
 //
-// Resamples the tone-mapped TAA output into the uint8 NCHW input tensor
-// expected by the loaded model (1x3xtile_in x tile_in per tile). The frame is
-// covered by a tiles_x * tiles_y grid of tile_in-sized tiles; each tile is one
-// inference. The geometry comes from the model via push constants, so this
-// shader does not care which QuickSRNet variant is loaded. See upscaler.c.
+// Copies the tone-mapped TAA output into the uint8 NCHW input tensor expected
+// by the loaded model (1x3xtile_in x tile_in per tile). The frame is covered by
+// a tiles_x * tiles_y grid of tile_in-sized tiles; each tile is one inference.
+// The copy is 1:1 -- the render extent is derived from the model's scale factor
+// so that it does not need resampling -- and the right/bottom remainder of the
+// grid is padded by replicating the edge texel. The geometry comes from the
+// model via push constants, so this shader does not care which QuickSRNet
+// variant is loaded. See upscaler.c.
 //
 // Each invocation packs 4 horizontally adjacent pixels into one uint so that
 // no two invocations write the same dword (GLSL has no uint8 storage).
@@ -71,26 +74,24 @@ void main()
 	uint ly     = gid.y % push.tile_in;
 	uint tile   = tile_y * push.tiles_x + tile_x;
 
-	// The tile grid is a virtual image that the whole TAA output is resampled
-	// into, so the upscaler works at any render resolution even though the
-	// model's input shape is fixed.
-	vec2 grid_size = vec2(push.tiles_x * push.tile_in, push.tiles_y * push.tile_in);
-
-	// vkpt_taa() only fills the top-left extent_taa_output rect of the
-	// extent_taa_images-sized texture, and outside TAAU those differ. Same
-	// correction as final_blit.frag.
-	vec2 taa_uv_scale = vec2(global_ubo.taa_output_width, global_ubo.taa_output_height)
-	                  / vec2(global_ubo.taa_image_width, global_ubo.taa_image_height);
+	// The render target is copied into the tile grid 1:1: get_render_extent()
+	// already sizes it at display / scale, so there is nothing to resample here.
+	// Past its right/bottom edge the tile is padded by replicating the edge
+	// texel rather than with black, which the model's receptive field would
+	// otherwise bleed inward as a dark halo along the last valid row/column.
+	//
+	// The clamp doubles as the correction for vkpt_taa() only filling the
+	// top-left extent_taa_output rect of the extent_taa_images-sized texture.
+	ivec2 src_max = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height) - 1;
+	int grid_y = int(tile_y * push.tile_in + ly);
 
 	uint packed_rgb[3] = uint[3](0u, 0u, 0u);
 
 	for (uint i = 0u; i < 4u; i++)
 	{
-		vec2 grid_pos = vec2(
-			float(tile_x * push.tile_in + qx * 4u + i) + 0.5,
-			float(tile_y * push.tile_in + ly) + 0.5);
+		int grid_x = int(tile_x * push.tile_in + qx * 4u + i);
 
-		vec3 color = textureLod(TEX_TAA_OUTPUT, (grid_pos / grid_size) * taa_uv_scale, 0).rgb;
+		vec3 color = texelFetch(TEX_TAA_OUTPUT, min(ivec2(grid_x, grid_y), src_max), 0).rgb;
 
 		// The model was trained on display-referred sRGB images; unpack applies
 		// the inverse so the round trip is symmetric.

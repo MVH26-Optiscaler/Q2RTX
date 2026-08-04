@@ -772,6 +772,14 @@ Default value is 0.
 | 2     | QuickSRNet Small |
 | 3     | QuickSRNet Large |
 
+While an AI upscaler is selected, the render resolution is dictated by the model's
+scale factor rather than chosen: the frame is rendered at display resolution divided
+by that factor (480x270 for a 1080p display and a 4x model) so that it can be copied
+into the network's input tensor 1:1, with the right and bottom remainder padded by
+replicating the edge pixel. Resampling the frame to fit the tensor instead would feed
+the network an aliased, anisotropically squashed image. `viewsize` and the dynamic
+resolution scaling cvars therefore have no effect in these modes.
+
 #### `flt_upscaler_enable`
 Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall and
 2 is QuickSRNetLarge. Default value is 0. Normally driven by `flt_upscaling` rather

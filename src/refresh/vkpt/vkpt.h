@@ -711,6 +711,9 @@ VkResult vkpt_upscaler_destroy(void);
 VkResult vkpt_upscaler_create_pipelines(void);
 VkResult vkpt_upscaler_destroy_pipelines(void);
 bool vkpt_upscaler_is_enabled(void);
+// The loaded model's integer scale factor, or 0 when the upscaler will not run.
+// The render extent is derived from it; see get_render_extent() in main.c.
+uint32_t vkpt_upscaler_get_scale(void);
 VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
 // Must be called after the command buffer holding vkpt_upscaler_do()'s pack
 // dispatch has been submitted, and before vkpt_upscaler_final_blit().
