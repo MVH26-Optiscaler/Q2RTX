@@ -1,0 +1,101 @@
+/*
+Copyright (C) 2019, NVIDIA CORPORATION. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NPU upscaler, pack pass.
+//
+// Resamples the tone-mapped TAA output into the fixed-shape uint8 NCHW input
+// tensor expected by the QuickSRNetSmall model (1x3x128x128 per tile). The
+// frame is covered by a tiles_x * tiles_y grid of 128x128 tiles; each tile is
+// one inference. See upscaler.c for the overview.
+//
+// Each invocation packs 4 horizontally adjacent pixels into one uint so that
+// no two invocations write the same dword (GLSL has no uint8 storage).
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+#include "upscaler_shared.h"
+
+layout(set = 2, binding = 0, std430) writeonly buffer InputTensorBuffer {
+	uint input_tensor[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint tiles_x;
+	uint tiles_y;
+} push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+	const uint quads_x = UPSCALER_TILE_IN / 4u; // 4 pixels packed per uint
+
+	uvec2 gid = gl_GlobalInvocationID.xy;
+	if (gid.x >= push.tiles_x * quads_x || gid.y >= push.tiles_y * UPSCALER_TILE_IN)
+		return;
+
+	uint tile_x = gid.x / quads_x;
+	uint qx     = gid.x % quads_x;
+	uint tile_y = gid.y / UPSCALER_TILE_IN;
+	uint ly     = gid.y % UPSCALER_TILE_IN;
+	uint tile   = tile_y * push.tiles_x + tile_x;
+
+	// The tile grid is a virtual image that the whole TAA output is resampled
+	// into, so the upscaler works at any render resolution even though the
+	// model's input shape is fixed.
+	vec2 grid_size = vec2(push.tiles_x * UPSCALER_TILE_IN, push.tiles_y * UPSCALER_TILE_IN);
+
+	uint packed_rgb[3] = uint[3](0u, 0u, 0u);
+
+	for (uint i = 0u; i < 4u; i++)
+	{
+		vec2 grid_pos = vec2(
+			float(tile_x * UPSCALER_TILE_IN + qx * 4u + i) + 0.5,
+			float(tile_y * UPSCALER_TILE_IN + ly) + 0.5);
+
+		vec3 color = textureLod(TEX_TAA_OUTPUT, grid_pos / grid_size, 0).rgb;
+
+		// The model was trained on display-referred sRGB images; unpack applies
+		// the inverse so the round trip is symmetric.
+		uvec3 bytes = uvec3(round(upscaler_linear_to_encoded(color) * 255.0));
+
+		packed_rgb[0] |= bytes.r << (8u * i);
+		packed_rgb[1] |= bytes.g << (8u * i);
+		packed_rgb[2] |= bytes.b << (8u * i);
+	}
+
+	const uint plane_stride = (UPSCALER_TILE_IN * UPSCALER_TILE_IN) / 4u;
+	uint base = tile * (3u * plane_stride) + ly * quads_x + qx;
+
+	input_tensor[base + 0u * plane_stride] = packed_rgb[0];
+	input_tensor[base + 1u * plane_stride] = packed_rgb[1];
+	input_tensor[base + 2u * plane_stride] = packed_rgb[2];
+}

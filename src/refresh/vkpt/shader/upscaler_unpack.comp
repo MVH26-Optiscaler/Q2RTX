@@ -1,0 +1,88 @@
+/*
+Copyright (C) 2019, NVIDIA CORPORATION. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NPU upscaler, unpack pass.
+//
+// Reads the uint8 NCHW output tensors produced by the model (1x3x512x512 per
+// tile) back into the screen-resolution image that the final blit consumes.
+// Inverse of upscaler_pack.comp; see upscaler.c for the overview.
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+#include "upscaler_shared.h"
+
+layout(set = 2, binding = 1, std430) readonly buffer OutputTensorBuffer {
+	uint output_tensor[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint tiles_x;
+	uint tiles_y;
+} push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+	ivec2 ipos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 out_size = imageSize(IMG_UPSCALE_OUTPUT);
+
+	if (any(greaterThanEqual(ipos, out_size)))
+		return;
+
+	// Map the screen pixel into the virtual upscaled tile grid. Nearest
+	// sampling is fine here: the grid is >= the screen and the model has
+	// already done the actual reconstruction.
+	vec2 grid_size = vec2(push.tiles_x * UPSCALER_TILE_OUT, push.tiles_y * UPSCALER_TILE_OUT);
+	vec2 uv = (vec2(ipos) + 0.5) / vec2(out_size);
+	ivec2 grid_pos = clamp(ivec2(uv * grid_size), ivec2(0), ivec2(grid_size) - 1);
+
+	uint tile_x = uint(grid_pos.x) / UPSCALER_TILE_OUT;
+	uint tile_y = uint(grid_pos.y) / UPSCALER_TILE_OUT;
+	uint lx     = uint(grid_pos.x) % UPSCALER_TILE_OUT;
+	uint ly     = uint(grid_pos.y) % UPSCALER_TILE_OUT;
+	uint tile   = tile_y * push.tiles_x + tile_x;
+
+	const uint plane_stride = (UPSCALER_TILE_OUT * UPSCALER_TILE_OUT) / 4u;
+
+	uint byte_index = ly * UPSCALER_TILE_OUT + lx;
+	uint base  = tile * (3u * plane_stride) + byte_index / 4u;
+	uint shift = (byte_index % 4u) * 8u;
+
+	uvec3 bytes;
+	bytes.r = (output_tensor[base + 0u * plane_stride] >> shift) & 0xffu;
+	bytes.g = (output_tensor[base + 1u * plane_stride] >> shift) & 0xffu;
+	bytes.b = (output_tensor[base + 2u * plane_stride] >> shift) & 0xffu;
+
+	vec3 color = upscaler_encoded_to_linear(vec3(bytes) / 255.0);
+
+	imageStore(IMG_UPSCALE_OUTPUT, ipos, vec4(color, 1));
+}
