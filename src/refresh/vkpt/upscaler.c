@@ -20,22 +20,30 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	AI upscaler ("upscaler") implementation overview
 	=================================================
 
-	Phase 1 (current): loads QuickSRNetSmall (w8a8, ONNX) through ONNX Runtime's
-	Qualcomm QNN Execution Provider and proves inference actually dispatches to
-	the Hexagon NPU on this Windows-ARM64 (Snapdragon) device, via a standalone
-	console-command-triggered test. There is no render-pipeline integration yet:
-	vkpt_upscaler_do()/_final_blit() are no-ops and no Vulkan resources are
-	created. That integration (pack/unpack compute shaders, GPU<->NPU staging
-	buffers, wiring into R_RenderFrame_RTX/R_EndFrame_RTX in place of FSR) is
-	Phase 2, tracked separately.
+	Runs a QuickSRNet super-resolution model (w8a8, ONNX) through ONNX Runtime's
+	Qualcomm QNN Execution Provider, so inference dispatches to the Hexagon NPU
+	on Windows-ARM64 (Snapdragon) devices.
 
-	The model's input/output tensors are a static NCHW uint8 shape (1x3x128x128
-	in, 1x3x512x512 out, i.e. a fixed 4x upscale) -- not dynamic -- so Phase 2's
-	shaders will need to tile the actual frame into 128x128 blocks.
+	Per frame: upscaler_pack.comp resamples the tone-mapped TAA output into a
+	grid of uint8 NCHW input tensors, the CPU runs one inference per tile on the
+	NPU, and upscaler_unpack.comp writes the results into IMG_UPSCALE_OUTPUT for
+	the final blit. The GPU->NPU->GPU round trip is a hard pipeline stall, which
+	is why the tile count has to stay low to be playable.
+
+	The models have static tensor shapes -- both QuickSRNetSmall and
+	QuickSRNetLarge are 1x3x128x128 uint8 in, 1x3x512x512 out -- so the frame is
+	tiled rather than fed in whole. The geometry is not hardcoded: it is queried
+	off whichever model is loaded and pushed to the shaders, so swapping in a
+	model with different fixed shapes needs no code change.
 
 	Q2RTX cvars
 	-----------
-	* flt_upscaler_enable - 0 = disable, 1 = enable the NPU upscaler.
+	* flt_upscaler_enable - which model to run: 0 = disabled, 1 = QuickSRNetSmall,
+	  2 = QuickSRNetLarge (see upscaler_models[]). Changing it reloads the ONNX
+	  Runtime session, which takes a few seconds because the QNN EP finalizes the
+	  HTP graph. Normally driven by the flt_upscaling menu cvar.
+	* flt_upscaler_verbose - raise ONNX Runtime logging to verbose, which is
+	  where per-node execution-provider assignment is reported.
 
 	Console commands
 	----------------
@@ -43,6 +51,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	  duration (default 3s) so NPU dispatch/utilization can be confirmed via
 	  Windows Task Manager > Performance > NPU while it runs, and via the
 	  verbose ONNX Runtime log lines this prints to the console.
+	* upscaler_dump - dump the pre- and post-upscale tensor for every tile of
+	  the next rendered frame as PNGs under <gamedir>/screenshots/upscaler/,
+	  for visually inspecting what goes into and comes out of the model.
 */
 
 #include "shared/shared.h"
@@ -59,19 +70,49 @@ extern cvar_t *cvar_flt_fsr_enable; // owned by fsr.c, initialized just before u
 
 cvar_t *cvar_flt_upscaling = NULL;
 
+// The NPU upscaler models, indexed by flt_upscaler_enable - 1. Both are square
+// fixed-shape uint8 NCHW models from Qualcomm AI Hub, staged into
+// <gamedir>/models by scripts/deploy-assets.ps1. Order matters: it defines both
+// the flt_upscaler_enable values and the flt_upscaling values below, so append
+// rather than insert.
+static const struct {
+	const char *name;
+	const char *path;
+} upscaler_models[] = {
+	{ "QuickSRNet Small", "models/quicksrnetsmall-w8a8.onnx" },
+	{ "QuickSRNet Large", "models/quicksrnetlarge-w8a8.onnx" },
+};
+
 // Menu-facing selector for the mutually exclusive upscalers. The per-backend
 // cvars stay authoritative so existing configs, scripts and console use keep
 // working; this just keeps them from being enabled at the same time.
 enum {
-	UPSCALING_MODE_NONE = 0,
-	UPSCALING_MODE_FSR  = 1,
-	UPSCALING_MODE_AI   = 2,
+	UPSCALING_MODE_NONE     = 0,
+	UPSCALING_MODE_FSR      = 1,
+	UPSCALING_MODE_AI_FIRST = 2, // 2 .. 2 + LENGTH(upscaler_models) - 1
 };
+
+// Loads whatever model flt_upscaler_enable now names. No-op until the ONNX
+// Runtime side is up, and cheap when the selection did not actually change.
+static void upscaler_reload_model(void);
 
 static void upscaling_mode_changed(cvar_t *self)
 {
+	// flt_upscaler_enable is a 1-based model index rather than a boolean, so
+	// everything that only asks "is the AI upscaler on?" still just tests it
+	// against zero, and an archived flt_upscaler_enable 1 still means the
+	// original model.
+	int model = self->integer - (UPSCALING_MODE_AI_FIRST - 1);
+	if (model < 1 || model > (int)LENGTH(upscaler_models))
+		model = 0;
+
 	Cvar_SetInteger(cvar_flt_fsr_enable, self->integer == UPSCALING_MODE_FSR, FROM_CODE);
-	Cvar_SetInteger(cvar_flt_upscaler_enable, self->integer == UPSCALING_MODE_AI, FROM_CODE);
+	Cvar_SetInteger(cvar_flt_upscaler_enable, model, FROM_CODE);
+
+	// Cvar_SetInteger(FROM_CODE) deliberately does not run change callbacks
+	// (change_string_value() in common/cvar.c), so the swap has to be kicked
+	// off from here rather than from flt_upscaler_enable's own callback.
+	upscaler_reload_model();
 }
 
 void vkpt_upscaler_init_cvars(void)
@@ -82,9 +123,17 @@ void vkpt_upscaler_init_cvars(void)
 	cvar_flt_upscaler_verbose = Cvar_Get("flt_upscaler_verbose", "0", 0);
 
 	// Seeded from whatever the backend cvars already say, so a config that set
-	// flt_fsr_enable directly shows up correctly in the menu.
-	const char *initial = cvar_flt_upscaler_enable->integer ? "2"
-		: (cvar_flt_fsr_enable && cvar_flt_fsr_enable->integer ? "1" : "0");
+	// flt_fsr_enable or flt_upscaler_enable directly shows up correctly in the
+	// menu, on the right model.
+	char initial[16];
+	if (cvar_flt_upscaler_enable->integer > 0 &&
+		cvar_flt_upscaler_enable->integer <= (int)LENGTH(upscaler_models))
+	{
+		Q_snprintf(initial, sizeof(initial), "%d",
+			UPSCALING_MODE_AI_FIRST - 1 + cvar_flt_upscaler_enable->integer);
+	} else {
+		Q_strlcpy(initial, cvar_flt_fsr_enable && cvar_flt_fsr_enable->integer ? "1" : "0", sizeof(initial));
+	}
 
 	cvar_flt_upscaling = Cvar_Get("flt_upscaling", initial, CVAR_ARCHIVE);
 	cvar_flt_upscaling->changed = upscaling_mode_changed;
@@ -97,20 +146,22 @@ void vkpt_upscaler_init_cvars(void)
 #include "onnxruntime_c_api.h"
 #include "vk_util.h"
 #include "shader/upscaler_shared.h"
+#include "stb_image_write.h"
 
-#define UPSCALER_MODEL_PATH "models/quicksrnetsmall-w8a8.onnx"
 #define UPSCALER_INPUT_NAME "image"
 #define UPSCALER_OUTPUT_NAME "upscaled_image"
 #define UPSCALER_NUM_DIMS 4
 #define UPSCALER_DEFAULT_TEST_SECONDS 3
 
-// Per-tile tensor sizes, in bytes (uint8, 3 channels, NCHW).
-#define UPSCALER_TILE_IN_BYTES  (3u * UPSCALER_TILE_IN  * UPSCALER_TILE_IN)
-#define UPSCALER_TILE_OUT_BYTES (3u * UPSCALER_TILE_OUT * UPSCALER_TILE_OUT)
+// Sanity bound on the model's output tile, so a bogus model can't ask for an
+// absurd staging allocation before anything else notices.
+#define UPSCALER_MAX_TILE 4096
 
 typedef struct {
 	uint32_t tiles_x;
 	uint32_t tiles_y;
+	uint32_t tile_in;  // model input  edge, pixels
+	uint32_t tile_out; // model output edge, pixels
 } upscaler_push_constants_t;
 
 struct
@@ -119,14 +170,18 @@ struct
 	OrtEnv        *env;
 	OrtSession    *session;
 	OrtMemoryInfo *cpu_memory_info;
+	bool           initialized;  // env/allocator are up; safe to load models
 	bool           model_loaded;
+	int            loaded_model; // 1-based index into upscaler_models, 0 = none
 
 	int64_t        input_dims[UPSCALER_NUM_DIMS];
 	int64_t        output_dims[UPSCALER_NUM_DIMS];
 	size_t         input_byte_size;  // uint8 tensor, 1 byte/element
 	size_t         output_byte_size;
+	uint32_t       tile_in;          // input_dims[2..3], validated square
+	uint32_t       tile_out;         // output_dims[2..3], validated square
 
-	// Phase 2 render integration.
+	// Render integration.
 	bool                  pipelines_ready;
 	VkPipeline            pipeline_pack;
 	VkPipeline            pipeline_unpack;
@@ -147,6 +202,10 @@ struct
 
 	// Set by vkpt_upscaler_do(), consumed by vkpt_upscaler_run_inference().
 	bool             packed_this_frame;
+
+	// One-shot flag set by the upscaler_dump console command, consumed and
+	// cleared by vkpt_upscaler_run_inference().
+	bool             dump_requested;
 
 	// Rolling cost of the NPU round trip. Accumulated over many frames because
 	// Sys_Milliseconds() is far too coarse to time a single frame's inference.
@@ -321,20 +380,198 @@ done:
 	Z_Free(output_data);
 }
 
-static void destroy_session(void)
+// Writes one planar (NCHW, uint8, RGB) size x size tensor tile out as a PNG,
+// for visually inspecting what actually goes into/comes out of the model.
+// Triggered by the "upscaler_dump" console command via vkpt_upscaler_run_inference().
+static void upscaler_dump_tensor(const char *stage, uint32_t tile, const uint8_t *planar, uint32_t size)
 {
-	if (upscaler.cpu_memory_info) {
-		upscaler.api->ReleaseMemoryInfo(upscaler.cpu_memory_info);
-		upscaler.cpu_memory_info = NULL;
+	uint8_t *interleaved = Z_Malloc((size_t)size * size * 3);
+
+	size_t plane_stride = (size_t)size * size;
+	for (uint32_t y = 0; y < size; y++) {
+		for (uint32_t x = 0; x < size; x++) {
+			size_t src = (size_t)y * size + x;
+			size_t dst = ((size_t)y * size + x) * 3;
+			interleaved[dst + 0] = planar[0 * plane_stride + src];
+			interleaved[dst + 1] = planar[1 * plane_stride + src];
+			interleaved[dst + 2] = planar[2 * plane_stride + src];
+		}
 	}
+
+	char path[MAX_OSPATH];
+	if (Q_snprintf(path, sizeof(path), "%s/screenshots/upscaler/upscaler_%s_%" PRIu64 "_tile%u.png",
+			fs_gamedir, stage, qvk.frame_counter, tile) >= sizeof(path))
+	{
+		Com_EPrintf("upscaler: dump path too long\n");
+		goto done;
+	}
+
+	if (FS_CreatePath(path) < 0) {
+		Com_EPrintf("upscaler: failed to create directory for '%s'\n", path);
+		goto done;
+	}
+
+	if (!stbi_write_png(path, size, size, 3, interleaved, size * 3))
+		Com_EPrintf("upscaler: failed to write '%s'\n", path);
+	else
+		Com_Printf("upscaler: wrote %s\n", path);
+
+done:
+	Z_Free(interleaved);
+}
+
+static void Upscaler_Dump_f(void)
+{
+	upscaler.dump_requested = true;
+	Com_Printf("upscaler: will dump pre/post-upscale tensors for the next frame\n");
+}
+
+static const cmdreg_t upscaler_cmds[] = {
+	{ "upscaler_npu_test", &Upscaler_NpuTest_f, NULL },
+	{ "upscaler_dump", &Upscaler_Dump_f, NULL },
+	{ NULL, NULL, NULL }
+};
+
+static void destroy_tensor_buffers(void); // defined with the render integration below
+
+// The pack/unpack shaders index x and y with the same tile edge and pack 4
+// pixels per dword, and the staging layout assumes 3 uint8 planes. Anything
+// outside that is rejected rather than rendered as garbage.
+static bool validate_tensor_geometry(const char *model_file)
+{
+	const int64_t *in = upscaler.input_dims, *out = upscaler.output_dims;
+
+	if (in[0] != 1 || in[1] != 3 || out[0] != 1 || out[1] != 3) {
+		Com_EPrintf("upscaler: %s is not a 1x3xNxN NCHW model "
+			"(in [%lld,%lld,...], out [%lld,%lld,...]); not loading\n", model_file,
+			(long long)in[0], (long long)in[1], (long long)out[0], (long long)out[1]);
+		return false;
+	}
+
+	if (in[2] != in[3] || out[2] != out[3]) {
+		Com_EPrintf("upscaler: %s tiles are not square (%lldx%lld -> %lldx%lld); not loading\n",
+			model_file, (long long)in[2], (long long)in[3], (long long)out[2], (long long)out[3]);
+		return false;
+	}
+
+	if (in[2] <= 0 || out[2] <= 0 || in[2] % 4 != 0 || out[2] % 4 != 0 || out[2] > UPSCALER_MAX_TILE) {
+		Com_EPrintf("upscaler: %s tile size %lld -> %lld is unsupported "
+			"(must be a positive multiple of 4, output at most %d); not loading\n",
+			model_file, (long long)in[2], (long long)out[2], UPSCALER_MAX_TILE);
+		return false;
+	}
+
+	upscaler.tile_in  = (uint32_t)in[2];
+	upscaler.tile_out = (uint32_t)out[2];
+	return true;
+}
+
+// Releases the session for whichever model is loaded. The env and the CPU
+// allocator outlive it, so switching models does not rebuild them.
+static void unload_model(void)
+{
 	if (upscaler.session) {
 		upscaler.api->ReleaseSession(upscaler.session);
 		upscaler.session = NULL;
 	}
-	if (upscaler.env) {
-		upscaler.api->ReleaseEnv(upscaler.env);
-		upscaler.env = NULL;
+
+	// The staging buffers are sized from the model's tile geometry, so they
+	// cannot outlive it. The pack/unpack dispatches referencing them may still
+	// be in flight, hence the wait.
+	if (qvk.device)
+		vkDeviceWaitIdle(qvk.device);
+	destroy_tensor_buffers();
+
+	upscaler.model_loaded = false;
+	upscaler.loaded_model = 0;
+	upscaler.tile_in = 0;
+	upscaler.tile_out = 0;
+}
+
+// Loads upscaler_models[index - 1]; index 0 just unloads. Creating the session
+// is expensive -- the QNN EP finalizes the HTP graph, which takes seconds -- so
+// this deliberately stalls rather than trying to hide the switch.
+static void load_model(int index)
+{
+	if (!upscaler.initialized || index == upscaler.loaded_model)
+		return;
+
+	unload_model();
+
+	if (index < 1 || index > (int)LENGTH(upscaler_models))
+		return;
+
+	const char *model_file = upscaler_models[index - 1].path;
+
+	OrtSessionOptions *session_options = NULL;
+	if (!ort_ok(upscaler.api->CreateSessionOptions(&session_options), "CreateSessionOptions"))
+		return;
+
+	{
+		const char *provider_keys[]   = { "backend_path", "htp_performance_mode", "htp_graph_finalization_optimization_mode" };
+		const char *provider_values[] = { "QnnHtp.dll", "high_performance", "3" };
+		OrtStatus *ep_status = upscaler.api->SessionOptionsAppendExecutionProvider(session_options, "QNN",
+			provider_keys, provider_values, LENGTH(provider_keys));
+		if (!ort_ok(ep_status, "SessionOptionsAppendExecutionProvider(QNN)")) {
+			Com_Printf("upscaler: QNN execution provider unavailable, NPU upscaler disabled\n");
+			upscaler.api->ReleaseSessionOptions(session_options);
+			return;
+		}
 	}
+
+	{
+		char model_path[MAX_OSPATH];
+		if (Q_concat(model_path, sizeof(model_path), fs_gamedir, PATH_SEP_STRING, model_file) >= sizeof(model_path)) {
+			Com_EPrintf("upscaler: model path too long\n");
+			upscaler.api->ReleaseSessionOptions(session_options);
+			return;
+		}
+
+		Com_Printf("upscaler: loading %s (%s), this takes a moment...\n",
+			model_file, upscaler_models[index - 1].name);
+
+		WCHAR wmodel_path[MAX_OSPATH];
+		MultiByteToWideChar(CP_UTF8, 0, model_path, -1, wmodel_path, MAX_OSPATH);
+
+		OrtStatus *session_status = upscaler.api->CreateSession(upscaler.env, wmodel_path, session_options, &upscaler.session);
+		upscaler.api->ReleaseSessionOptions(session_options);
+
+		if (!ort_ok(session_status, "CreateSession")) {
+			Com_Printf("upscaler: could not load %s, %s unavailable "
+				"(run scripts/deploy-assets.ps1 -WithUpscalerModel to fetch it)\n",
+				model_path, upscaler_models[index - 1].name);
+			return;
+		}
+	}
+
+	if (!query_tensor_shape(true, 0, UPSCALER_INPUT_NAME, upscaler.input_dims, &upscaler.input_byte_size) ||
+		!query_tensor_shape(false, 0, UPSCALER_OUTPUT_NAME, upscaler.output_dims, &upscaler.output_byte_size) ||
+		!validate_tensor_geometry(model_file))
+	{
+		unload_model();
+		return;
+	}
+
+	upscaler.model_loaded = true;
+	upscaler.loaded_model = index;
+
+	Com_Printf("upscaler: %s loaded, %ux%u -> %ux%u per tile; "
+		"run 'upscaler_npu_test' to verify NPU dispatch\n",
+		upscaler_models[index - 1].name,
+		upscaler.tile_in, upscaler.tile_in, upscaler.tile_out, upscaler.tile_out);
+}
+
+// flt_upscaler_enable selects the model, so changing it swaps the session.
+// Reached both from the menu, via upscaling_mode_changed(), and from setting
+// flt_upscaler_enable straight from the console.
+static void upscaler_reload_model(void)
+{
+	load_model(cvar_flt_upscaler_enable->integer);
+}
+
+static void upscaler_model_changed(cvar_t *self)
+{
+	load_model(self->integer);
 }
 
 VkResult vkpt_upscaler_initialize(void)
@@ -358,86 +595,42 @@ VkResult vkpt_upscaler_initialize(void)
 			"q2rtx_upscaler", &upscaler.env), "CreateEnvWithCustomLogger"))
 		return VK_SUCCESS;
 
-	OrtSessionOptions *session_options = NULL;
-	if (!ort_ok(upscaler.api->CreateSessionOptions(&session_options), "CreateSessionOptions"))
-		goto fail;
-
-	{
-		const char *provider_keys[]   = { "backend_path", "htp_performance_mode", "htp_graph_finalization_optimization_mode" };
-		const char *provider_values[] = { "QnnHtp.dll", "high_performance", "3" };
-		OrtStatus *ep_status = upscaler.api->SessionOptionsAppendExecutionProvider(session_options, "QNN",
-			provider_keys, provider_values, LENGTH(provider_keys));
-		if (!ort_ok(ep_status, "SessionOptionsAppendExecutionProvider(QNN)")) {
-			Com_Printf("upscaler: QNN execution provider unavailable, NPU upscaler disabled\n");
-			upscaler.api->ReleaseSessionOptions(session_options);
-			goto fail;
-		}
+	if (!ort_ok(upscaler.api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &upscaler.cpu_memory_info), "CreateCpuMemoryInfo")) {
+		upscaler.api->ReleaseEnv(upscaler.env);
+		upscaler.env = NULL;
+		return VK_SUCCESS;
 	}
 
-	{
-		char model_path[MAX_OSPATH];
-		if (Q_concat(model_path, sizeof(model_path), fs_gamedir, PATH_SEP_STRING, UPSCALER_MODEL_PATH) >= sizeof(model_path)) {
-			Com_EPrintf("upscaler: model path too long\n");
-			upscaler.api->ReleaseSessionOptions(session_options);
-			goto fail;
-		}
+	Cmd_Register(upscaler_cmds);
 
-		WCHAR wmodel_path[MAX_OSPATH];
-		MultiByteToWideChar(CP_UTF8, 0, model_path, -1, wmodel_path, MAX_OSPATH);
+	upscaler.initialized = true;
 
-		OrtStatus *session_status = upscaler.api->CreateSession(upscaler.env, wmodel_path, session_options, &upscaler.session);
-		upscaler.api->ReleaseSessionOptions(session_options);
+	// Picking a different model from the menu or the console reloads the
+	// session; init_cvars runs long before we exist, so the callback is only
+	// hooked up here, and load_model() no-ops until initialized is set.
+	cvar_flt_upscaler_enable->changed = upscaler_model_changed;
+	load_model(cvar_flt_upscaler_enable->integer);
 
-		if (!ort_ok(session_status, "CreateSession")) {
-			Com_Printf("upscaler: could not load %s, NPU upscaler unavailable\n", model_path);
-			goto fail;
-		}
-	}
-
-	if (!query_tensor_shape(true, 0, UPSCALER_INPUT_NAME, upscaler.input_dims, &upscaler.input_byte_size))
-		goto fail;
-	if (!query_tensor_shape(false, 0, UPSCALER_OUTPUT_NAME, upscaler.output_dims, &upscaler.output_byte_size))
-		goto fail;
-
-	// The pack/unpack shaders hardcode the tile geometry (upscaler_shared.h),
-	// so a model with different fixed dimensions would silently corrupt the
-	// tensor layout. Refuse it rather than render garbage.
-	if (upscaler.input_byte_size != UPSCALER_TILE_IN_BYTES ||
-		upscaler.output_byte_size != UPSCALER_TILE_OUT_BYTES)
-	{
-		Com_EPrintf("upscaler: model tensors are %zu->%zu bytes, expected %ux%u->%ux%u RGB8 "
-			"(%u->%u bytes); NPU upscaler disabled\n",
-			upscaler.input_byte_size, upscaler.output_byte_size,
-			UPSCALER_TILE_IN, UPSCALER_TILE_IN, UPSCALER_TILE_OUT, UPSCALER_TILE_OUT,
-			UPSCALER_TILE_IN_BYTES, UPSCALER_TILE_OUT_BYTES);
-		goto fail;
-	}
-
-	if (!ort_ok(upscaler.api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &upscaler.cpu_memory_info), "CreateCpuMemoryInfo"))
-		goto fail;
-
-	upscaler.model_loaded = true;
-
-	{
-		cmdreg_t cmds[] = {
-			{ "upscaler_npu_test", &Upscaler_NpuTest_f, NULL },
-			{ NULL, NULL, NULL }
-		};
-		Cmd_Register(cmds);
-	}
-
-	Com_Printf("upscaler: NPU upscaler model loaded (%s); run 'upscaler_npu_test' to verify NPU dispatch\n", UPSCALER_MODEL_PATH);
-	return VK_SUCCESS;
-
-fail:
-	destroy_session();
 	return VK_SUCCESS;
 }
 
 VkResult vkpt_upscaler_destroy(void)
 {
-	destroy_session();
-	upscaler.model_loaded = false;
+	unload_model();
+
+	upscaler.initialized = false;
+	cvar_flt_upscaler_enable->changed = NULL;
+	Cmd_Deregister(upscaler_cmds);
+
+	if (upscaler.cpu_memory_info) {
+		upscaler.api->ReleaseMemoryInfo(upscaler.cpu_memory_info);
+		upscaler.cpu_memory_info = NULL;
+	}
+	if (upscaler.env) {
+		upscaler.api->ReleaseEnv(upscaler.env);
+		upscaler.env = NULL;
+	}
+
 	return VK_SUCCESS;
 }
 
@@ -487,8 +680,8 @@ static bool ensure_tensor_buffers(uint32_t tiles_x, uint32_t tiles_y)
 	destroy_tensor_buffers();
 
 	uint32_t num_tiles = tiles_x * tiles_y;
-	VkDeviceSize input_size  = (VkDeviceSize)num_tiles * UPSCALER_TILE_IN_BYTES;
-	VkDeviceSize output_size = (VkDeviceSize)num_tiles * UPSCALER_TILE_OUT_BYTES;
+	VkDeviceSize input_size  = (VkDeviceSize)num_tiles * upscaler.input_byte_size;
+	VkDeviceSize output_size = (VkDeviceSize)num_tiles * upscaler.output_byte_size;
 
 	const VkMemoryPropertyFlags host_props =
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -690,7 +883,9 @@ static void bind_upscaler_pipeline(VkCommandBuffer cmd_buf, VkPipeline pipeline)
 	vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
 		upscaler.pipeline_layout, 0, LENGTH(desc_sets), desc_sets, 0, NULL);
 
-	upscaler_push_constants_t push = { upscaler.tiles_x, upscaler.tiles_y };
+	upscaler_push_constants_t push = {
+		upscaler.tiles_x, upscaler.tiles_y, upscaler.tile_in, upscaler.tile_out
+	};
 	vkCmdPushConstants(cmd_buf, upscaler.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
 		0, sizeof(push), &push);
 }
@@ -699,11 +894,13 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 {
 	upscaler.packed_this_frame = false;
 
-	// One tile of model output covers UPSCALER_TILE_OUT pixels of the final
-	// image; the grid is sized to cover it and the edges are cropped on unpack.
-	VkExtent2D out = qvk.extent_screen_images;
-	uint32_t tiles_x = (out.width  + UPSCALER_TILE_OUT - 1) / UPSCALER_TILE_OUT;
-	uint32_t tiles_y = (out.height + UPSCALER_TILE_OUT - 1) / UPSCALER_TILE_OUT;
+	// One tile of model output covers upscaler.tile_out pixels of the final
+	// image; the grid is sized to cover the display extent and the edges are
+	// cropped on unpack. Sizing it from extent_screen_images instead would run
+	// extra inferences for pixels that are never presented.
+	VkExtent2D out = qvk.extent_unscaled;
+	uint32_t tiles_x = (out.width  + upscaler.tile_out - 1) / upscaler.tile_out;
+	uint32_t tiles_y = (out.height + upscaler.tile_out - 1) / upscaler.tile_out;
 
 	if (tiles_x == 0 || tiles_y == 0)
 		return VK_SUCCESS;
@@ -717,8 +914,8 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 	bind_upscaler_pipeline(cmd_buf, upscaler.pipeline_pack);
 
 	// The pack shader writes 4 horizontally adjacent pixels per invocation.
-	uint32_t dispatch_x = tiles_x * (UPSCALER_TILE_IN / 4);
-	uint32_t dispatch_y = tiles_y * UPSCALER_TILE_IN;
+	uint32_t dispatch_x = tiles_x * (upscaler.tile_in / 4);
+	uint32_t dispatch_y = tiles_y * upscaler.tile_in;
 	vkCmdDispatch(cmd_buf, (dispatch_x + 7) / 8, (dispatch_y + 7) / 8, 1);
 
 	// Make the shader writes visible to the host read in run_inference().
@@ -754,6 +951,9 @@ VkResult vkpt_upscaler_run_inference(void)
 
 	upscaler.packed_this_frame = false;
 
+	bool dump = upscaler.dump_requested;
+	upscaler.dump_requested = false;
+
 	vkQueueWaitIdle(qvk.queue_graphics);
 
 	unsigned time_begin = Sys_Milliseconds();
@@ -764,20 +964,23 @@ VkResult vkpt_upscaler_run_inference(void)
 
 	for (uint32_t tile = 0; tile < num_tiles; tile++)
 	{
-		uint8_t *in  = (uint8_t *)upscaler.input_mapped  + (size_t)tile * UPSCALER_TILE_IN_BYTES;
-		uint8_t *out = (uint8_t *)upscaler.output_mapped + (size_t)tile * UPSCALER_TILE_OUT_BYTES;
+		uint8_t *in  = (uint8_t *)upscaler.input_mapped  + (size_t)tile * upscaler.input_byte_size;
+		uint8_t *out = (uint8_t *)upscaler.output_mapped + (size_t)tile * upscaler.output_byte_size;
+
+		if (dump)
+			upscaler_dump_tensor("pre", tile, in, upscaler.tile_in);
 
 		OrtValue *input_value = NULL, *output_value = NULL;
 
 		// Wrapping the mapped staging memory directly avoids an extra copy on
 		// each side of the inference.
 		if (!ort_ok(upscaler.api->CreateTensorWithDataAsOrtValue(upscaler.cpu_memory_info, in,
-				UPSCALER_TILE_IN_BYTES, upscaler.input_dims, UPSCALER_NUM_DIMS,
+				upscaler.input_byte_size, upscaler.input_dims, UPSCALER_NUM_DIMS,
 				ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, &input_value), "CreateTensorWithDataAsOrtValue(input)"))
 			break;
 
 		if (!ort_ok(upscaler.api->CreateTensorWithDataAsOrtValue(upscaler.cpu_memory_info, out,
-				UPSCALER_TILE_OUT_BYTES, upscaler.output_dims, UPSCALER_NUM_DIMS,
+				upscaler.output_byte_size, upscaler.output_dims, UPSCALER_NUM_DIMS,
 				ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, &output_value), "CreateTensorWithDataAsOrtValue(output)"))
 		{
 			upscaler.api->ReleaseValue(input_value);
@@ -799,6 +1002,9 @@ VkResult vkpt_upscaler_run_inference(void)
 			upscaler.api->ReleaseStatus(status);
 			break;
 		}
+
+		if (dump)
+			upscaler_dump_tensor("post", tile, out, upscaler.tile_out);
 	}
 
 	upscaler.inference_ms_accum += Sys_Milliseconds() - time_begin;
@@ -823,7 +1029,9 @@ VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 
 	bind_upscaler_pipeline(cmd_buf, upscaler.pipeline_unpack);
 
-	VkExtent2D out = qvk.extent_screen_images;
+	// Unpack writes only the display rect of IMG_UPSCALE_OUTPUT, matching what
+	// the final blit below samples back out of it.
+	VkExtent2D out = qvk.extent_unscaled;
 	vkCmdDispatch(cmd_buf, (out.width + 7) / 8, (out.height + 7) / 8, 1);
 
 	BARRIER_COMPUTE(cmd_buf, qvk.images[VKPT_IMG_UPSCALE_OUTPUT]);
@@ -834,6 +1042,12 @@ VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 }
 
 #else // !USE_ORT_QNN_UPSCALER
+
+// No ONNX Runtime in this build, so there is nothing to swap; flt_upscaling
+// still multiplexes correctly, the AI entries just never become available.
+static void upscaler_reload_model(void)
+{
+}
 
 VkResult vkpt_upscaler_initialize(void)
 {

@@ -19,10 +19,11 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 // ========================================================================== //
 // NPU upscaler, pack pass.
 //
-// Resamples the tone-mapped TAA output into the fixed-shape uint8 NCHW input
-// tensor expected by the QuickSRNetSmall model (1x3x128x128 per tile). The
-// frame is covered by a tiles_x * tiles_y grid of 128x128 tiles; each tile is
-// one inference. See upscaler.c for the overview.
+// Resamples the tone-mapped TAA output into the uint8 NCHW input tensor
+// expected by the loaded model (1x3xtile_in x tile_in per tile). The frame is
+// covered by a tiles_x * tiles_y grid of tile_in-sized tiles; each tile is one
+// inference. The geometry comes from the model via push constants, so this
+// shader does not care which QuickSRNet variant is loaded. See upscaler.c.
 //
 // Each invocation packs 4 horizontally adjacent pixels into one uint so that
 // no two invocations write the same dword (GLSL has no uint8 storage).
@@ -50,38 +51,46 @@ layout(set = 2, binding = 0, std430) writeonly buffer InputTensorBuffer {
 layout(push_constant) uniform PushConstants {
 	uint tiles_x;
 	uint tiles_y;
+	uint tile_in;  // model input  edge, pixels
+	uint tile_out; // model output edge, pixels (unused here)
 } push;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 void main()
 {
-	const uint quads_x = UPSCALER_TILE_IN / 4u; // 4 pixels packed per uint
+	const uint quads_x = push.tile_in / 4u; // 4 pixels packed per uint
 
 	uvec2 gid = gl_GlobalInvocationID.xy;
-	if (gid.x >= push.tiles_x * quads_x || gid.y >= push.tiles_y * UPSCALER_TILE_IN)
+	if (gid.x >= push.tiles_x * quads_x || gid.y >= push.tiles_y * push.tile_in)
 		return;
 
 	uint tile_x = gid.x / quads_x;
 	uint qx     = gid.x % quads_x;
-	uint tile_y = gid.y / UPSCALER_TILE_IN;
-	uint ly     = gid.y % UPSCALER_TILE_IN;
+	uint tile_y = gid.y / push.tile_in;
+	uint ly     = gid.y % push.tile_in;
 	uint tile   = tile_y * push.tiles_x + tile_x;
 
 	// The tile grid is a virtual image that the whole TAA output is resampled
 	// into, so the upscaler works at any render resolution even though the
 	// model's input shape is fixed.
-	vec2 grid_size = vec2(push.tiles_x * UPSCALER_TILE_IN, push.tiles_y * UPSCALER_TILE_IN);
+	vec2 grid_size = vec2(push.tiles_x * push.tile_in, push.tiles_y * push.tile_in);
+
+	// vkpt_taa() only fills the top-left extent_taa_output rect of the
+	// extent_taa_images-sized texture, and outside TAAU those differ. Same
+	// correction as final_blit.frag.
+	vec2 taa_uv_scale = vec2(global_ubo.taa_output_width, global_ubo.taa_output_height)
+	                  / vec2(global_ubo.taa_image_width, global_ubo.taa_image_height);
 
 	uint packed_rgb[3] = uint[3](0u, 0u, 0u);
 
 	for (uint i = 0u; i < 4u; i++)
 	{
 		vec2 grid_pos = vec2(
-			float(tile_x * UPSCALER_TILE_IN + qx * 4u + i) + 0.5,
-			float(tile_y * UPSCALER_TILE_IN + ly) + 0.5);
+			float(tile_x * push.tile_in + qx * 4u + i) + 0.5,
+			float(tile_y * push.tile_in + ly) + 0.5);
 
-		vec3 color = textureLod(TEX_TAA_OUTPUT, grid_pos / grid_size, 0).rgb;
+		vec3 color = textureLod(TEX_TAA_OUTPUT, (grid_pos / grid_size) * taa_uv_scale, 0).rgb;
 
 		// The model was trained on display-referred sRGB images; unpack applies
 		// the inverse so the round trip is symmetric.
@@ -92,7 +101,7 @@ void main()
 		packed_rgb[2] |= bytes.b << (8u * i);
 	}
 
-	const uint plane_stride = (UPSCALER_TILE_IN * UPSCALER_TILE_IN) / 4u;
+	uint plane_stride = (push.tile_in * push.tile_in) / 4u;
 	uint base = tile * (3u * plane_stride) + ly * quads_x + qx;
 
 	input_tensor[base + 0u * plane_stride] = packed_rgb[0];

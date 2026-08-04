@@ -761,6 +761,36 @@ Range is from 0.0 to 2.0, with lower meaning sharper.
 Individual control of the upscaling and sharpening steps of FSR. Both default to 1.
 Intended for testing purposes.
 
+#### `flt_upscaling`
+Selects the upscaler shown in the video settings menu. The upscalers are mutually
+exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable` for you.
+Default value is 0.
+| Value | Upscaler         |
+| ----- | ---------------- |
+| 0     | none             |
+| 1     | AMD FSR 1.0      |
+| 2     | QuickSRNet Small |
+| 3     | QuickSRNet Large |
+
+#### `flt_upscaler_enable`
+Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall and
+2 is QuickSRNetLarge. Default value is 0. Normally driven by `flt_upscaling` rather
+than set directly.
+
+Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon), and
+the model staged into `baseq2/models` — run `scripts/deploy-assets.ps1 -WithUpscalerModel`
+to fetch it from Qualcomm AI Hub. If the model is missing or the QNN execution provider
+is unavailable, the upscaler stays off and says so on the console.
+
+Changing this reloads the ONNX Runtime session, which stalls for a few seconds while
+the QNN execution provider finalizes the model for the NPU.
+
+#### `flt_upscaler_verbose`
+Raises ONNX Runtime logging to verbose, which is where the per-node execution-provider
+assignment is reported — the authoritative way to confirm inference really dispatches
+to the NPU rather than falling back to the CPU. Far too chatty for normal play.
+Default value is 0.
+
 #### `gr_enable`
 Enables the god rays (volumetric lighting) effect. Default value is 1.
 
