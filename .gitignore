@@ -65,3 +65,5 @@ baseq2/models/*
 !baseq2/models/quicksrnetlarge.data
 !baseq2/models/quicksrnetlarge-w8a8.metadata.json
 !baseq2/models/quicksrnetlarge-q2rtx-w8a8.onnx
+!baseq2/models/nss-temporal-high-int8.onnx
+!baseq2/models/nss-temporal-high-int8.metadata.json

@@ -54,6 +54,9 @@ layout(push_constant) uniform PushConstants {
 	uint tiles_y;
 	uint tile_in;  // model input  edge, pixels
 	uint tile_out; // model output edge, pixels (unused here)
+	uint src_width;
+	uint src_height;
+	uint src_is_nss; // 0 = TEX_TAA_OUTPUT, 1 = TEX_NSS_OUTPUT
 } push;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -82,9 +85,12 @@ void main()
 	// receptive field would otherwise bleed inward as a dark halo along the last
 	// valid row/column.
 	//
-	// The clamp doubles as the correction for vkpt_taa() only filling the
-	// top-left extent_taa_output rect of the extent_taa_images-sized texture.
-	ivec2 src_max = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height) - 1;
+	// The clamp doubles as the correction for the source pass only filling a
+	// top-left sub-rect of an image allocated at the screen-image extent -- true
+	// of vkpt_taa()'s extent_taa_output and of NSS's reconstruct alike. Hence the
+	// rect comes from a push constant rather than the UBO's taa_output_*: which
+	// pass produced the source depends on whether NSS is chained in front.
+	ivec2 src_max = ivec2(push.src_width, push.src_height) - 1;
 	int grid_y = int(tile_y * push.tile_in + ly);
 
 	uint packed_rgb[3] = uint[3](0u, 0u, 0u);
@@ -93,7 +99,10 @@ void main()
 	{
 		int grid_x = int(tile_x * push.tile_in + qx * 4u + i);
 
-		vec3 color = texelFetch(TEX_TAA_OUTPUT, min(ivec2(grid_x, grid_y), src_max), 0).rgb;
+		ivec2 src_px = min(ivec2(grid_x, grid_y), src_max);
+		vec3 color = (push.src_is_nss != 0u)
+			? texelFetch(TEX_NSS_OUTPUT, src_px, 0).rgb
+			: texelFetch(TEX_TAA_OUTPUT, src_px, 0).rgb;
 
 		// The tone-mapped values go to the model as they are, with no transfer
 		// curve applied. Encoding here and inverting it in unpack would hand the

@@ -736,7 +736,41 @@ Red channel shows low-frequency (GI) gradients, green channel shows direct diffu
 and blue channel shows direct specular gradients. Default value is 0.
 
 #### `flt_taa`
-Enables temporal anti-aliasing and primary ray direction jitter. Default value is 1.
+Selects the temporal anti-aliasing / reconstruction mode, and with it primary ray
+direction jitter. Default value is 2.
+| Value | Mode                                                        |
+| ----- | ----------------------------------------------------------- |
+| 0     | none                                                         |
+| 1     | temporal AA                                                  |
+| 2     | temporal upscaling (TAAU)                                    |
+| 3     | NSS Temporal (NPU)                                           |
+
+Value 3 selects Arm's Neural Super Sampling model and, like `flt_upscaling`, acts as a
+selector: it drives `flt_nss_enable` for you and deselects FSR. It lives here rather
+than in `flt_upscaling` because it reconstructs from frame history the way TAA and TAAU
+do, rather than upscaling each frame independently the way FSR and QuickSRNet do — it
+replaces the temporal AA stage rather than competing with the spatial upscalers.
+
+Because the two occupy different stages, **NSS and a QuickSRNet upscaler can both be
+on**. They then chain: NSS reconstructs the frame temporally at 2x, and the spatial
+model upscales that result, which the unpack pass downsamples to the display. This costs
+a second CPU/NPU round trip per frame on top of the first, and the spatial stage sees an
+input already at 2x the render extent, so its tile count is high — at 1080p the chain is
+about 136 serial inferences per frame. It is a quality configuration, not a playable one.
+See `flt_upscaler_max_tiles`.
+
+Note NSS does not replace TAA in the pipeline, only in the menu: it consumes TAA's
+output, because the path-traced frame is too noisy at these sample counts to hand to the
+network directly. In this mode TAAU runs at 1:1 (so it behaves as plain TAA, with
+jitter) and NSS performs the reconstruction.
+
+This cvar is not archived, so it is not written to your config directly; the NSS
+selection persists through `flt_nss_enable`, which is.
+
+#### `flt_nss_enable`
+Whether the NSS temporal model is loaded, 0 or 1. Default value is 0. Normally driven by
+`flt_taa` rather than set directly. It is a separate cvar from `flt_upscaler_enable`
+precisely so the temporal and spatial models can be loaded at the same time.
 
 #### `flt_fsr_enable`
 Enables FidelityFX Super Resolution 1.0 ("AMD FSR 1.0") upscaling. Default value is 0.
@@ -762,9 +796,9 @@ Individual control of the upscaling and sharpening steps of FSR. Both default to
 Intended for testing purposes.
 
 #### `flt_upscaling`
-Selects the upscaler shown in the video settings menu. The upscalers are mutually
-exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable` for you.
-Default value is 0.
+Selects the *spatial* upscaler shown in the video settings menu. The upscalers are
+mutually exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable`
+for you. Default value is 0.
 | Value | Upscaler                       |
 | ----- | ------------------------------ |
 | 0     | none                           |
@@ -773,20 +807,40 @@ Default value is 0.
 | 3     | QuickSRNet Large               |
 | 4     | QuickSRNet Large (Q2RTX-tuned) |
 
-While an AI upscaler is selected, the render resolution is dictated by the model's
-scale factor rather than chosen: the frame is rendered at display resolution divided
-by that factor (480x270 for a 1080p display and a 4x model) so that it can be copied
-into the network's input tensor 1:1, with the right and bottom remainder padded by
-replicating the edge pixel. Resampling the frame to fit the tensor instead would feed
-the network an aliased, anisotropically squashed image. `viewsize` and the dynamic
-resolution scaling cvars therefore have no effect in these modes.
+The temporal NSS model is not in this list; it is selected with `flt_taa 3`. The two are
+independent — see `flt_taa` for what happens when both are on.
+
+A QuickSRNet model's scale factor is a property of the model, not a resolution policy:
+`viewsize` and the dynamic resolution scaling cvars choose the render extent exactly as
+they do for every other path, and the model then multiplies it by its fixed factor.
+Whatever that overshoots the display by is removed on the way out by an area-weighted
+box filter.
+
+So the downsample ratio is `viewsize * scale / 100`. With a 4x model, `viewsize 25`
+lands on the display exactly (480x270 at 1080p) and no resampling happens — the cheap
+upscale-for-performance case. Above that the extra resolution is real supersampling,
+and at `viewsize 100` the path tracer renders at native resolution and the frame is
+4x-downsampled. That is high quality and far too slow for gameplay, since the tile
+count — and with it the number of serial NPU inferences — grows with the square of
+`viewsize`. See `flt_upscaler_max_tiles`.
 
 #### `flt_upscaler_enable`
 Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall,
-2 is QuickSRNetLarge and 3 is a QuickSRNetLarge fine-tuned on Quake II RTX frames,
-which trades generality for sharper results on this game's content at the same cost as
-the stock Large model. Default value is 0. Normally driven by `flt_upscaling` rather
-than set directly.
+2 is QuickSRNetLarge, 3 is a QuickSRNetLarge fine-tuned on Quake II RTX frames (which
+trades generality for sharper results on this game's content at the same cost as the
+stock Large model). Default value is 0. Normally driven by `flt_upscaling` rather than
+set directly. The NSS Temporal model is not selectable here — it has its own slot,
+`flt_nss_enable`; an archived config naming it is migrated on startup.
+
+NSS Temporal (Arm's Neural Super Sampling) is a different kind of model from the
+QuickSRNet family: rather than a stateless spatial upscale, it consumes motion vectors,
+depth and its own cross-frame feedback to reconstruct the frame with temporal
+accumulation, similar in spirit to DLSS/FSR2. That is why it is selected from `flt_taa`
+alongside the other temporal modes. It was exported at one fixed shape (see
+`baseq2/models/nss-temporal-high-int8.metadata.json`), so unlike the QuickSRNet models
+its render resolution is entirely fixed and `viewsize`/DRS have no effect on it at all.
+It targets a roughly 1080p-class display; on very different display resolutions its
+quality degrades gracefully but was not tuned for that case.
 
 Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon). The
 models themselves ship in `baseq2/models`. If a model file is missing or the QNN

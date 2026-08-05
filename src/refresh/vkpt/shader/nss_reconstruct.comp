@@ -1,0 +1,255 @@
+/*
+Copyright (C) 2026, Q2RTX contributors.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NSS temporal upscaler, post-process (reconstruction) pass.
+//
+// Applies the network's per-pixel KPN filter to the low-res colour, then
+// temporally blends the result against reprojected history using the
+// network's own learned blend/sharpen parameters, producing the final
+// upscaled frame directly at display resolution. Adapted from Arm's
+// C:\Users\qc_de\neural-super-sampling\scenario\3_post_process_shared.h,
+// restricted to the one configuration this integration targets: the "high"
+// preset's NSS_FILTER_MODE=0 (static 6x6 KPN tap LUT for an exact 2x scale)
+// and NSS_INPUT_LAYOUT=0 (full-resolution preprocess outputs) -- the mid/low
+// dynamic-LUT and half-res modes are out of scope. The kKernelLut/kTapDx*/
+// kTapDy*/kTapCh* constants below are Arm's, transcribed verbatim: they are
+// literally the trained model's fixed tap geometry, not something to
+// re-derive.
+//
+// Adaptations from Arm's reference (mirrors nss_pack.comp's header -- see
+// there for the full rationale):
+//  - The KPN/temporal tensors are plain float32 in this build (no int8
+//    QDQ/SNORM dequantization needed).
+//  - Q2RTX's colour pipeline is already tonemapped to [0,1] display-referred
+//    values by the time TEX_TAA_OUTPUT is written (see upscaler_pack.comp),
+//    so unlike Arm's raw-HDR pipeline this needs no Karis Tonemap/
+//    InverseTonemap/exposure round trip anywhere -- the KPN-filtered and
+//    temporally-blended result is composited directly in that same space.
+//  - Motion vectors are UV-space (prev_uv = uv + motion), which is also
+//    resolution-independent, so reprojecting from display resolution down to
+//    the low-res motion buffer needs no unit conversion, unlike Arm's
+//    pixel-space motion.
+//  - No jitter-driven LUT-offset rotation (Arm's _LutOffset) and no global
+//    reset flag (Arm's _Reset, e.g. on a camera cut) -- both are per-frame
+//    push-constant state this integration does not plumb through; the tile
+//    index used to pick a kKernelLut entry is just output_px & 1, and history
+//    is always trusted subject to the existing onscreen/AABB checks. A camera
+//    cut still recovers within a few frames via those checks, just not
+//    instantly.
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+layout(set = 2, binding = 1, std430) readonly buffer NssKpnBuffer {
+	float nss_kpn_tensor[];
+};
+
+layout(set = 2, binding = 2, std430) readonly buffer NssTemporalTensorBuffer {
+	float nss_temporal_tensor[];
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float EPS = 1e-7;
+const int   KPN_CHANNELS = 36; // "high" preset, kpn_size=6x6
+
+// -- Arm's static 2x KPN tap LUT (NSS_FILTER_MODE == 0), transcribed verbatim
+// from 3_post_process_shared.h. See file header: this is the trained model's
+// fixed tap geometry, not derived math.
+const ivec4 kTapDx0 = ivec4(0, 0, 0, 2);
+const ivec4 kTapDy0 = ivec4(0, 2, 4, 0);
+const ivec4 kTapCh0 = ivec4(0, 2, 4, 12);
+const ivec4 kTapDx1 = ivec4(2, 2, 4, 4);
+const ivec4 kTapDy1 = ivec4(2, 4, 0, 2);
+const ivec4 kTapCh1 = ivec4(14, 16, 24, 26);
+const ivec2 kTapD2 = ivec2(4, 4);
+const int   kTapCh2 = 28;
+
+struct KernelPattern { ivec2 base_offset; int base_channel; };
+const KernelPattern kKernelLut[4] = KernelPattern[4](
+	KernelPattern(ivec2(-1, -1), 7),
+	KernelPattern(ivec2(-2, -1), 1),
+	KernelPattern(ivec2(-1, -2), 6),
+	KernelPattern(ivec2(-2, -2), 0)
+);
+
+vec3 fetch_colour_tap(ivec2 lr_tap, ivec2 taa_max)
+{
+	return texelFetch(TEX_TAA_OUTPUT, clamp(lr_tap, ivec2(0), taa_max), 0).rgb;
+}
+
+float fetch_kpn_weight(int channel, ivec2 kpn_tap, ivec2 kpn_dims)
+{
+	ivec2 p = clamp(kpn_tap, ivec2(0), kpn_dims - 1);
+	int plane = kpn_dims.x * kpn_dims.y;
+	int base = p.y * kpn_dims.x + p.x;
+	return max(nss_kpn_tensor[channel * plane + base], EPS);
+}
+
+ivec2 kpn_coord_from_scaled_tap(ivec2 lr_tap, ivec2 kpn_dims)
+{
+	// kpn_dims is exactly render_size/4 (enforced at model load), so the scale
+	// is always 0.25; ported from Arm's KpnCoordFromScaledTap.
+	vec2 scaled = floor((vec2(lr_tap) + vec2(0.5)) * 0.25);
+	return clamp(ivec2(scaled), ivec2(0), kpn_dims - 1);
+}
+
+vec4 fetch_temporal_texel(ivec2 p, ivec2 size)
+{
+	p = clamp(p, ivec2(0), size - 1);
+	int plane = size.x * size.y;
+	int base = p.y * size.x + p.x;
+	return vec4(
+		nss_temporal_tensor[0 * plane + base],
+		nss_temporal_tensor[1 * plane + base],
+		nss_temporal_tensor[2 * plane + base],
+		nss_temporal_tensor[3 * plane + base]
+	);
+}
+
+vec4 sample_temporal_bilinear(vec2 px_render, ivec2 size)
+{
+	vec2 f = fract(px_render - 0.5);
+	ivec2 base = ivec2(floor(px_render - 0.5));
+	vec4 c00 = fetch_temporal_texel(base + ivec2(0, 0), size);
+	vec4 c10 = fetch_temporal_texel(base + ivec2(1, 0), size);
+	vec4 c01 = fetch_temporal_texel(base + ivec2(0, 1), size);
+	vec4 c11 = fetch_temporal_texel(base + ivec2(1, 1), size);
+	return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+// KPN filter for one output pixel: two 4-wide tap groups plus a single extra
+// tap, each weighted by the network's coefficients and accumulated into
+// first/second colour moments (for the AABB clamp below) plus a flagged
+// "center_sample" used as the learned-alpha blend target.
+void filter_colour(ivec2 output_px, ivec2 taa_max, ivec2 kpn_dims,
+	out vec4 m1, out vec4 m2, out vec4 center_sample)
+{
+	ivec2 colour_max = taa_max;
+	ivec2 tile_idx = output_px & ivec2(1);
+	int lut_idx = tile_idx.y * 2 + tile_idx.x;
+	KernelPattern lut = kKernelLut[lut_idx];
+
+	vec4 accum_m1 = vec4(0.0);
+	vec4 accum_m2 = vec4(0.0);
+	center_sample = vec4(0.0);
+
+	for (int i = 0; i < 4; i++) {
+		ivec2 tap = clamp((output_px + lut.base_offset + ivec2(kTapDx0[i], kTapDy0[i])) >> 1, ivec2(0), colour_max);
+		ivec2 kpn_tap = kpn_coord_from_scaled_tap(tap, kpn_dims);
+		vec3 c = fetch_colour_tap(tap, taa_max);
+		float w = fetch_kpn_weight(kTapCh0[i] + lut.base_channel, kpn_tap, kpn_dims);
+		accum_m1 += vec4(c, 1.0) * w;
+		accum_m2 += vec4(c * c, 1.0) * w;
+	}
+
+	for (int i = 0; i < 4; i++) {
+		ivec2 tap = clamp((output_px + lut.base_offset + ivec2(kTapDx1[i], kTapDy1[i])) >> 1, ivec2(0), colour_max);
+		ivec2 kpn_tap = kpn_coord_from_scaled_tap(tap, kpn_dims);
+		vec3 c = fetch_colour_tap(tap, taa_max);
+		float w = fetch_kpn_weight(kTapCh1[i] + lut.base_channel, kpn_tap, kpn_dims);
+		accum_m1 += vec4(c, 1.0) * w;
+		accum_m2 += vec4(c * c, 1.0) * w;
+		if (lut_idx == 3 && i == 0)
+			center_sample = vec4(c, 1.0);
+	}
+
+	{
+		ivec2 tap2 = clamp((output_px + lut.base_offset + kTapD2) >> 1, ivec2(0), colour_max);
+		ivec2 kpn_tap2 = kpn_coord_from_scaled_tap(tap2, kpn_dims);
+		vec3 c = fetch_colour_tap(tap2, taa_max);
+		float w = fetch_kpn_weight(lut.base_channel + kTapCh2, kpn_tap2, kpn_dims);
+		accum_m1 += vec4(c, 1.0) * w;
+		accum_m2 += vec4(c * c, 1.0) * w;
+	}
+
+	float denom = max(accum_m1.a, EPS);
+	m1 = vec4(accum_m1.rgb / denom, 0.0);
+	m2 = vec4(accum_m2.rgb / denom, 0.0);
+}
+
+void main()
+{
+	// out_size is the model's true output extent (render_size at an exact 2x
+	// scale, the only ratio the static KPN tap LUT below is valid for), not
+	// the arbitrary display resolution -- see file header. Standalone, the final
+	// blit (nss_final_blit() in upscaler.c) stretches this corner sub-rect of
+	// VKPT_IMG_NSS_OUTPUT to fill the actual swapchain; with a spatial model
+	// chained behind it, upscaler_pack.comp reads the sub-rect instead.
+	ivec2 render_size = ivec2(global_ubo.width, global_ubo.height);
+	ivec2 out_size = render_size * 2;
+	ivec2 output_px = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(output_px, out_size)))
+		return;
+
+	ivec2 taa_max = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height) - 1;
+	ivec2 kpn_dims = render_size / 4;
+
+	vec4 m1, m2, center_sample;
+	filter_colour(output_px, taa_max, kpn_dims, m1, m2, center_sample);
+
+	// Motion is UV-space and resolution-independent (see file header), so no
+	// scale conversion is needed between display and render resolution here.
+	vec2 uv = (vec2(output_px) + vec2(0.5)) / vec2(out_size);
+	ivec2 motion_px = clamp(ivec2(uv * vec2(render_size)), ivec2(0), render_size - 1);
+	vec2 motion = texelFetch(TEX_FLAT_MOTION, motion_px, 0).xy;
+	vec2 reproj_uv = uv + motion;
+	float onscreen = float(all(greaterThanEqual(reproj_uv, vec2(0.0))) && all(lessThanEqual(reproj_uv, vec2(1.0))));
+
+	// NSS_HISTORY_COLOR_B is allocated at extent_screen_images, a fixed
+	// display-sized upper bound that can exceed the actual display -- see
+	// nss_pack.comp's equivalent comment. sample_texture_catmull_rom already
+	// takes pixel coordinates, so this needs no manual textureSize() UV fixup.
+	vec2 history_px = reproj_uv * vec2(out_size);
+	vec4 warped_history = vec4(sample_texture_catmull_rom(TEX_NSS_HISTORY_COLOR_B, history_px).rgb, 1.0);
+
+	vec4 temporal_params = sample_temporal_bilinear(uv * vec2(render_size), render_size);
+	float theta_in = clamp(temporal_params.x, 0.0, 1.0);
+	float theta_a = theta_in * theta_in;
+	float theta_b = (1.0 - theta_in) * (1.0 - theta_in);
+	float theta = theta_a / max(theta_a + theta_b, 1e-6);
+	float alpha = temporal_params.y * 0.35 + 0.05;
+	float gamma = temporal_params.z * 2.0;
+
+	// AABB temporal clamp (ClampHistoryToStats in the reference), reset == 1
+	// always -- see file header on why there is no global reset flag here.
+	vec4 sigma = vec4(sqrt(max(abs(m2 - m1 * m1), vec4(EPS))) * gamma);
+	sigma.a = 0.0;
+	vec4 aabb_min = m1 - sigma;
+	vec4 aabb_max = m1 + sigma;
+	vec4 history_clamped = clamp(warped_history, aabb_min, aabb_max);
+	vec4 rectified = mix(history_clamped, warped_history, theta * onscreen);
+
+	float learnt_alpha = alpha * center_sample.a;
+	vec3 out_colour = clamp(mix(rectified.rgb, center_sample.rgb, learnt_alpha), vec3(0.0), vec3(1.0));
+
+	imageStore(IMG_NSS_OUTPUT, output_px, vec4(out_colour, 1.0));
+	imageStore(IMG_NSS_HISTORY_COLOR_A, output_px, vec4(out_colour, 1.0));
+}

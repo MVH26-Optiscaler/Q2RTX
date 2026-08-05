@@ -44,11 +44,11 @@
     whatever name the model asks for.
 
     The models are NOT part of the game and are never taken from the game install. All
-    three ship in the repo under baseq2\models, so you normally need neither this
+    four ship in the repo under baseq2\models, so you normally need neither this
     parameter nor -WithUpscalerModel; use this one to try a model built elsewhere.
     Models already in baseq2\models are validated either way, and an absent one is
     reported as a warning rather than an error - everything except the matching
-    flt_upscaling setting works without it.
+    upscaler setting works without it.
 
 .PARAMETER WithUpscalerModel
     Re-download the two Qualcomm AI Hub models - QuickSRNetSmall (flt_upscaling 2) and
@@ -59,8 +59,10 @@
     that script fetches the TFLite variants because it targets USE_LITE_RT, while
     upscaler.c on this branch loads ONNX.
 
-    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) is skipped: it is fine-tuned
-    locally rather than published, so the repo is its only source.
+    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) and the NSS temporal model
+    (flt_taa 3) are skipped: neither has an upstream zip to fetch (the former is
+    fine-tuned locally, the latter comes from a separate Arm checkout, not QAI Hub), so
+    the repo is their only source.
 
     Note the rename asymmetry, which is what makes this fiddly to do by hand: each zip
     ships e.g. quicksrnetsmall.onnx + quicksrnetsmall.data, and the model must be
@@ -120,30 +122,38 @@ $Baseq2   = Join-Path $RepoRoot "baseq2"
 # Q2RTX-tuned model is produced locally, not published, so the repo is its only
 # source.
 #
-# Onnx is the filename upscaler.c loads relative to the game dir and Mode is the
-# flt_upscaling value that selects it; both come from upscaler_models[] in
-# src/refresh/vkpt/upscaler.c and must stay in step with it.
+# Onnx is the filename upscaler.c loads relative to the game dir and Selector is the
+# console setting that picks it; both come from upscaler_models[] in
+# src/refresh/vkpt/upscaler.c and must stay in step with it. The spatial models are
+# selected from flt_upscaling, the temporal one from flt_taa -- see the menu-selector
+# comments in upscaler.c.
 $QaiHubBaseUrl  = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/{0}/releases/v0.57.3"
 $UpscalerModels = @(
     @{
-        Id   = "quicksrnetsmall"
-        Zip  = "quicksrnetsmall-onnx-w8a8.zip"
-        Sha  = "22a62639f0523dee0b1e492f86785a9d27a70f1225894b096941d6a662d5968f"
-        Onnx = "quicksrnetsmall-w8a8.onnx"
-        Mode = 2
+        Id       = "quicksrnetsmall"
+        Zip      = "quicksrnetsmall-onnx-w8a8.zip"
+        Sha      = "22a62639f0523dee0b1e492f86785a9d27a70f1225894b096941d6a662d5968f"
+        Onnx     = "quicksrnetsmall-w8a8.onnx"
+        Selector = "flt_upscaling 2"
     },
     @{
-        Id   = "quicksrnetlarge"
-        Zip  = "quicksrnetlarge-onnx-w8a8.zip"
-        Sha  = "7aafb97849a90844028fd862537f8c8ff27aafef89a034939daa0e4d5f656f42"
-        Onnx = "quicksrnetlarge-w8a8.onnx"
-        Mode = 3
+        Id       = "quicksrnetlarge"
+        Zip      = "quicksrnetlarge-onnx-w8a8.zip"
+        Sha      = "7aafb97849a90844028fd862537f8c8ff27aafef89a034939daa0e4d5f656f42"
+        Onnx     = "quicksrnetlarge-w8a8.onnx"
+        Selector = "flt_upscaling 3"
     },
     @{
-        Id      = "quicksrnetlarge-q2rtx"
-        Onnx    = "quicksrnetlarge-q2rtx-w8a8.onnx"
-        Mode    = 4
-        Bundled = $true
+        Id       = "quicksrnetlarge-q2rtx"
+        Onnx     = "quicksrnetlarge-q2rtx-w8a8.onnx"
+        Selector = "flt_upscaling 4"
+        Bundled  = $true
+    },
+    @{
+        Id       = "nss-temporal-high"
+        Onnx     = "nss-temporal-high-int8.onnx"
+        Selector = "flt_taa 3"
+        Bundled  = $true
     }
 )
 
@@ -450,7 +460,7 @@ function Test-UpscalerModel {
             # not exist.
             $how = "re-run with -WithUpscalerModel"
             if ($m.Bundled) { $how = "restore it with: git checkout -- baseq2/models" }
-            Add-Warning "baseq2\models\$($m.Onnx) is absent; flt_upscaling $($m.Mode) will be unavailable ($how)"
+            Add-Warning "baseq2\models\$($m.Onnx) is absent; $($m.Selector) will be unavailable ($how)"
             continue
         }
         Write-Ok "$($m.Onnx) present"

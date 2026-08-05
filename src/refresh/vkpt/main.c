@@ -250,6 +250,15 @@ static bool upscaler_active_this_frame(void)
 
 static VkExtent2D get_render_extent(void)
 {
+	// The NSS temporal upscaler was exported at one fixed input shape (see
+	// nss-temporal-high-int8.onnx / tools/export_onnx_int8.py in the
+	// neural-super-sampling checkout), unlike the spatial QuickSRNet models,
+	// which tile and box-filter to absorb whatever viewsize/DRS hands them.
+	// While NSS is loaded, viewsize/DRS have no effect on render resolution.
+	VkExtent2D temporal_extent;
+	if (vkpt_upscaler_get_temporal_extent(&temporal_extent))
+		return temporal_extent;
+
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -292,6 +301,19 @@ static VkExtent2D get_screen_image_extent(void)
 	{
 		result.width = max(qvk.extent_render.width, qvk.extent_unscaled.width);
 		result.height = max(qvk.extent_render.height, qvk.extent_unscaled.height);
+	}
+
+	// NSS's reconstruct pass writes a corner sub-rect sized at its model's
+	// true output extent (render extent at an exact 2x scale -- see
+	// nss_reconstruct.comp's header), which can exceed qvk.extent_unscaled
+	// when the real window/display is smaller than that (e.g. a windowed
+	// client below ~1920x1088). Floor unconditionally so IMG_WIDTH/HEIGHT is
+	// always big enough for that write, regardless of which branch above ran.
+	VkExtent2D nss_extent;
+	if (vkpt_upscaler_get_temporal_extent(&nss_extent))
+	{
+		result.width = max(result.width, nss_extent.width * 2);
+		result.height = max(result.height, nss_extent.height * 2);
 	}
 
 	result.width = (result.width + 1) & ~1;
@@ -2648,6 +2670,18 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 		return;
 
 	int flt_taa = cvar_flt_taa->integer;
+
+	// AA_MODE_NSS selects the NSS temporal upscaler, which is not an alternative
+	// to TAA but a consumer of it: nss_pack.comp reads TEX_TAA_OUTPUT, and it
+	// wants the jitter-resolved frame, so the mode it really needs underneath is
+	// AA_MODE_UPSCALE. The pin at the bottom of this function then holds TAAU to
+	// 1:1 and leaves the actual upscaling to the network.
+	bool nss_selected = (flt_taa == AA_MODE_NSS);
+	if (nss_selected)
+	{
+		flt_taa = AA_MODE_UPSCALE;
+	}
+
 	// FSR RCAS needs upscaled input; if EASU was disabled, force to TAAU
 	bool force_upscaling = vkpt_fsr_is_enabled() && vkpt_fsr_needs_upscale();
 	if(force_upscaling)
@@ -2661,7 +2695,14 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 	}
 	else if (flt_taa == AA_MODE_UPSCALE) // TAAU or TAA+FSR
 	{
-		if (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height)
+		// Dropping to plain TAA here is for the case TAAU cannot serve, where the
+		// render extent already meets or exceeds the display so there is nothing
+		// to upsample. NSS is exempt: its render extent is the model's fixed one
+		// and can exceed a small window, but TAAU is pinned to 1:1 below either
+		// way, so the only thing this branch would change is turning the jitter
+		// off -- which starves the network of the samples it reconstructs from.
+		if (!nss_selected
+			&& (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height))
 		{
 			qvk.effective_aa_mode = AA_MODE_TAA;
 		}
@@ -3937,7 +3978,8 @@ R_Init_RTX(bool total)
 
 	drs_init();
 	vkpt_fsr_init_cvars();
-	vkpt_upscaler_init_cvars();
+	// vkpt_upscaler_init_cvars() is deliberately not here next to the other two:
+	// it hooks flt_taa, which the UBO_CVAR_LIST block below is what registers.
 
 	// Minimum NVIDIA driver version - this is a cvar in case something changes in the future,
 	// and the current test no longer works.
@@ -3968,6 +4010,10 @@ R_Init_RTX(bool total)
 #define UBO_CVAR_DO(name, default_value) cvar_##name = Cvar_Get(#name, #default_value, 0);
 	UBO_CVAR_LIST
 #undef UBO_CVAR_LIST
+
+	// Needs cvar_flt_taa (registered just above) and cvar_flt_fsr_enable (from
+	// vkpt_fsr_init_cvars, further up), because it multiplexes both.
+	vkpt_upscaler_init_cvars();
 
 	cvar_flt_temporal_hf->changed = temporal_cvar_changed;
 	cvar_flt_temporal_lf->changed = temporal_cvar_changed;

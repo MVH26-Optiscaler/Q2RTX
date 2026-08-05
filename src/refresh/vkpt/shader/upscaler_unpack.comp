@@ -44,8 +44,11 @@ layout(set = 2, binding = 1, std430) readonly buffer OutputTensorBuffer {
 layout(push_constant) uniform PushConstants {
 	uint tiles_x;
 	uint tiles_y;
-	uint tile_in;  // model input  edge, pixels (unused here)
+	uint tile_in;  // model input  edge, pixels
 	uint tile_out; // model output edge, pixels
+	uint src_width;   // rect of the source image the pack pass read
+	uint src_height;
+	uint src_is_nss;  // unused here; see upscaler_pack.comp
 } push;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -93,11 +96,13 @@ void main()
 	if (any(greaterThanEqual(ipos, out_size)))
 		return;
 
-	// Pack copied the render target into the tile grid 1:1, so the meaningful
-	// part of the model output is the render target scaled by the model's factor.
-	// Everything past that is tile padding grown from replicated edge texels.
+	// Pack copied the source into the tile grid 1:1, so the meaningful part of
+	// the model output is that source scaled by the model's factor. Everything
+	// past it is tile padding grown from replicated edge texels. Same push
+	// constant pack clamped its reads to, so the two cannot disagree about what
+	// the source was -- which matters because it is not always the TAA output.
 	int scale = int(push.tile_out / push.tile_in);
-	ivec2 valid = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height) * scale;
+	ivec2 valid = ivec2(push.src_width, push.src_height) * scale;
 
 	// The model always multiplies by its fixed factor, so the result overshoots
 	// the display by viewsize * scale / 100 and this pass resolves the excess.
