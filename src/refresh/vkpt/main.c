@@ -909,18 +909,33 @@ init_vulkan(void)
 	
 	/* instance extensions */
 
-	if (!SDL_Vulkan_GetInstanceExtensions(qvk.window, &qvk.num_sdl2_extensions, NULL)) {
-		Com_EPrintf("Couldn't get SDL2 Vulkan extension count\n");
-		return false;
+	if (vid.headless) {
+		/* no window system: present into a headless surface instead */
+		static const char *const headless_extensions[] = {
+			VK_KHR_SURFACE_EXTENSION_NAME,
+			VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME,
+		};
+
+		qvk.num_sdl2_extensions = LENGTH(headless_extensions);
+		qvk.sdl2_extensions = malloc(sizeof(char*) * qvk.num_sdl2_extensions);
+		memcpy(qvk.sdl2_extensions, headless_extensions, sizeof(headless_extensions));
+
+		Com_Printf("Vulkan instance extensions required for headless rendering: \n");
+	} else {
+		if (!SDL_Vulkan_GetInstanceExtensions(qvk.window, &qvk.num_sdl2_extensions, NULL)) {
+			Com_EPrintf("Couldn't get SDL2 Vulkan extension count\n");
+			return false;
+		}
+
+		qvk.sdl2_extensions = malloc(sizeof(char*) * qvk.num_sdl2_extensions);
+		if (!SDL_Vulkan_GetInstanceExtensions(qvk.window, &qvk.num_sdl2_extensions, qvk.sdl2_extensions)) {
+			Com_EPrintf("Couldn't get SDL2 Vulkan extensions\n");
+			return false;
+		}
+
+		Com_Printf("Vulkan instance extensions required by SDL2: \n");
 	}
 
-	qvk.sdl2_extensions = malloc(sizeof(char*) * qvk.num_sdl2_extensions);
-	if (!SDL_Vulkan_GetInstanceExtensions(qvk.window, &qvk.num_sdl2_extensions, qvk.sdl2_extensions)) {
-		Com_EPrintf("Couldn't get SDL2 Vulkan extensions\n");
-		return false;
-	}
-
-	Com_Printf("Vulkan instance extensions required by SDL2: \n");
 	for (int i = 0; i < qvk.num_sdl2_extensions; i++) {
 		Com_Printf("  %s\n", qvk.sdl2_extensions[i]);
 	}
@@ -1020,7 +1035,21 @@ init_vulkan(void)
 	_VK(qvkCreateDebugUtilsMessengerEXT(qvk.instance, &dbg_create_info, NULL, &qvk.dbg_messenger));
 
 	/* create surface */
-	if(!SDL_Vulkan_CreateSurface(qvk.window, qvk.instance, &qvk.surface)) {
+	if (vid.headless) {
+		if (!qvkCreateHeadlessSurfaceEXT) {
+			Com_EPrintf("Vulkan driver does not support %s!\n", VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
+			return false;
+		}
+
+		VkHeadlessSurfaceCreateInfoEXT surface_create_info = {
+			.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
+		};
+
+		if(qvkCreateHeadlessSurfaceEXT(qvk.instance, &surface_create_info, NULL, &qvk.surface) != VK_SUCCESS) {
+			Com_EPrintf("Could not create a headless surface!\n");
+			return false;
+		}
+	} else if(!SDL_Vulkan_CreateSurface(qvk.window, qvk.instance, &qvk.surface)) {
 		Com_EPrintf("SDL2 could not create a surface!\n");
 		return false;
 	}
@@ -3406,9 +3435,15 @@ recreate_swapchain(void)
 	vkDeviceWaitIdle(qvk.device);
 	vkpt_destroy_all(VKPT_INIT_SWAPCHAIN_RECREATE);
 	destroy_swapchain();
-	SDL_Vulkan_GetDrawableSize(qvk.window, &qvk.draw_width, &qvk.draw_height);
-	r_config.width = qvk.draw_width;
-	r_config.height = qvk.draw_height;
+	if (vid.headless) {
+		// no window to ask, the driver already put the requested size in r_config
+		qvk.draw_width = r_config.width;
+		qvk.draw_height = r_config.height;
+	} else {
+		SDL_Vulkan_GetDrawableSize(qvk.window, &qvk.draw_width, &qvk.draw_height);
+		r_config.width = qvk.draw_width;
+		r_config.height = qvk.draw_height;
+	}
 	create_swapchain();
 	vkpt_initialize_all(VKPT_INIT_SWAPCHAIN_RECREATE);
 
@@ -3848,8 +3883,13 @@ R_Init_RTX(bool total)
 		return REF_TYPE_NONE;
 	}
 
-    extern SDL_Window *get_sdl_window(void);
-    qvk.window = get_sdl_window();
+    if (vid.headless) {
+        // no window at all; the surface comes from VK_EXT_headless_surface
+        qvk.window = NULL;
+    } else {
+        extern SDL_Window *get_sdl_window(void);
+        qvk.window = get_sdl_window();
+    }
 
 	cvar_profiler = Cvar_Get("profiler", "0", 0);
 	cvar_profiler_samples = Cvar_Get("profiler_samples", "60", CVAR_ARCHIVE);

@@ -24,6 +24,10 @@ typedef enum { GAPI_OPENGL, GAPI_VULKAN } graphics_api_t;
 typedef struct {
     const char *name;
 
+    // no window and no display connection: the renderer must not go through
+    // SDL for instance extensions, surface creation or drawable size
+    bool headless;
+
     bool (*probe)(void);
     bool (*init)(graphics_api_t api);
     void (*shutdown)(void);

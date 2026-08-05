@@ -325,7 +325,8 @@ extern QVK_t qvk;
 
 #define LIST_EXTENSIONS_INSTANCE \
 	VK_EXTENSION_DO(vkCmdBeginDebugUtilsLabelEXT) \
-	VK_EXTENSION_DO(vkCmdEndDebugUtilsLabelEXT)
+	VK_EXTENSION_DO(vkCmdEndDebugUtilsLabelEXT) \
+	VK_EXTENSION_DO(vkCreateHeadlessSurfaceEXT)
 
 #define VK_EXTENSION_DO(a) extern PFN_##a q##a;
 LIST_EXTENSIONS_ACCEL_STRUCT

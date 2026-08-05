@@ -120,6 +120,12 @@ SET(CMAKE_INTERPROCEDURAL_OPTIMIZATION ${CONFIG_BUILD_IPO})
 
 add_subdirectory(src)
 
+# q2rtx_capture is the binary this branch is about; make it what Visual Studio
+# starts under F5 as well as what a bare build produces.
+IF(TARGET capture)
+    SET_PROPERTY(DIRECTORY PROPERTY VS_STARTUP_PROJECT capture)
+ENDIF()
+
 IF(CONFIG_LINUX_PACKAGING_SUPPORT)
     # https://cmake.org/cmake/help/v3.8/module/CPackDeb.html
     set(CPACK_GENERATOR "DEB")

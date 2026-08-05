@@ -108,6 +108,7 @@ SET(SRC_CLIENT
 	client/refresh.c
 	client/screen.c
 	client/tent.c
+	client/vid_headless.c
 	client/view.c
 	client/ui/demos.c
 	client/ui/menu.c
@@ -576,7 +577,8 @@ IF (IS_64_BIT AND CONFIG_VKPT_RENDERER)
     LIST(APPEND SRC_CAPTURE_CLIENT client/capture_stubs.c)
 
     # The platform audio backends go with the sound engine; the video backend
-    # stays, because the Vulkan swapchain still needs a window.
+    # stays so that "+set vid_driver sdl" can still open a window for debugging,
+    # even though the default here is the windowless driver.
     SET(SRC_CAPTURE_PLATFORM ${SRC_LINUX_CLIENT})
     SET(SRC_CAPTURE_PLATFORM_WIN ${SRC_WINDOWS_CLIENT})
     LIST(REMOVE_ITEM SRC_CAPTURE_PLATFORM unix/sound/sdl.c)
@@ -604,8 +606,11 @@ IF (IS_64_BIT AND CONFIG_VKPT_RENDERER)
         )
     ENDIF()
 
+    # USE_CAPTURE makes vid_driver default to "headless" (client/refresh.c), so
+    # the tool runs with no window and no display connection unless it is asked
+    # for one with "+set vid_driver sdl".
     TARGET_COMPILE_DEFINITIONS(capture PRIVATE
-        USE_CLIENT=1 USE_SDL=1
+        USE_CLIENT=1 USE_SDL=1 USE_CAPTURE=1
         REF_VKPT=1 USE_REF=1
         "${COMMON_COMPILE_DEFS}")
 
@@ -639,6 +644,13 @@ IF (IS_64_BIT AND CONFIG_VKPT_RENDERER)
         RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_SOURCE_DIR}"
         DEBUG_POSTFIX ""
     )
+
+    # This branch exists to produce training data, so q2rtx_capture is what a
+    # plain "make"/"ninja" builds. The playable client is still here, it just
+    # has to be asked for by name: "make client" / "ninja client".
+    IF (TARGET client)
+        SET_TARGET_PROPERTIES(client PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    ENDIF()
 ENDIF()
 
 SOURCE_GROUP("game\\sources" FILES ${SRC_GAME})
@@ -790,8 +802,12 @@ ENDIF()
 
 IF(CONFIG_LINUX_PACKAGING_SUPPORT)
     # Put the real game binary in /usr/share so we can have a wrapper in /usr/bin
+    IF(TARGET capture)
+        INSTALL(TARGETS capture DESTINATION share/quake2rtx/bin COMPONENT shareware)
+    ENDIF()
     IF(TARGET client)
-        INSTALL(TARGETS client DESTINATION share/quake2rtx/bin COMPONENT shareware)
+        # Not in ALL on this branch, so only install it if something built it.
+        INSTALL(TARGETS client DESTINATION share/quake2rtx/bin COMPONENT shareware OPTIONAL)
     ENDIF()
     INSTALL(TARGETS server DESTINATION games COMPONENT shareware)
 

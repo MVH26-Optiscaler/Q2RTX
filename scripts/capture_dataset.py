@@ -19,8 +19,12 @@ about 2.7 minutes and yields ~1200 tiles at ~1.4 GB. 84 rounds is therefore
 roughly 100,000 tiles, 3.8 hours and 117 GB. A full forty-map install yields far
 more per round.
 
-A window opens and drives itself. It ignores keyboard and mouse entirely, so
-nothing you type can disturb it, and it closes itself when each round is done.
+Nothing appears on screen: the capture tool renders headless, off a
+VK_EXT_headless_surface with no window and no display connection, so a run needs
+no DISPLAY or WAYLAND_DISPLAY and does not fight the desktop for the machine.
+That is also why --geometry is the real render resolution rather than a size a
+compositor is free to clamp to the monitor. Pass --windowed to watch a round.
+Each round drives itself and exits when it is done.
 
 Output:
 
@@ -161,8 +165,15 @@ def capture(args, raw_dir):
         print(f"\n=== round {index} of {args.rounds} ({have} tiles so far) ===", flush=True)
 
         write_user_cfg(user_cfg, args, index)
+
+        # The video driver is chosen in CL_InitRefresh(), before capture_user.cfg
+        # is ever read, so a window has to be asked for on the command line.
+        command = [str(binary)]
+        if args.windowed:
+            command += ["+set", "vid_driver", "sdl"]
+
         try:
-            result = run([str(binary)], cwd=REPO, timeout=args.timeout)
+            result = run(command, cwd=REPO, timeout=args.timeout)
         except subprocess.TimeoutExpired:
             sys.exit(f"round {index} did not finish within {args.timeout}s")
         finally:
@@ -369,6 +380,11 @@ def main():
     parser.add_argument("--filter", choices=("bicubic-encoded", "area-linear"),
                         default="bicubic-encoded", help="how to produce the LR input")
     parser.add_argument("--no-dedup", action="store_true", help="keep near-duplicate tiles")
+
+    parser.add_argument("--windowed", action="store_true",
+                        help="render into a window instead of headless. Needs a "
+                             "display, and the compositor may clamp --geometry "
+                             "to the size of the monitor")
 
     parser.add_argument("--raw-dir", help="where the engine writes tiles (default: auto-detect)")
     parser.add_argument("--timeout", type=int, default=6 * 60 * 60,

@@ -66,14 +66,24 @@ dataset/lr/*.png    128x128 uint8, the training input
 Pairs are matched by filename. There is no train/validation split -- hold out
 whatever you want at training time.
 
-A window opens and drives itself. It ignores the keyboard and mouse entirely, so
-nothing you type can disturb it, and it closes itself when the pass is done.
-Leave it alone and do something else — but note it does hold the GPU.
+Nothing appears on screen. The tool renders headless — `vid_driver headless`,
+which creates a `VK_EXT_headless_surface` instead of a window, so a run needs no
+`DISPLAY`, no `WAYLAND_DISPLAY` and no compositor, and works fine over SSH. It
+drives itself and exits when the pass is done. Leave it alone and do something
+else — but note it does hold the GPU.
+
+Pass `--windowed` (or run the binary with `+set vid_driver sdl`) to watch a pass
+instead. That path needs a display and is only there for debugging.
 
 **Capture at 4K if the machine can take it.** Tiles are crops at render scale,
 not resizes of the frame, so resolution decides how many distinct tiles a frame
 can yield: 3840x2160 holds 7x4 = 28 disjoint 512 tiles, 1920x1080 holds only
 3x2 = 6. It is the single highest-leverage setting here.
+
+Headless matters for exactly this: with a window, `--geometry 3840x2160` is a
+*request*, and a compositor on a 1440p monitor will hand back a smaller drawable
+and quietly cut the tile yield per frame. Headless renders the size that was
+asked for, whatever the machine is plugged into.
 
 ---
 
@@ -126,6 +136,7 @@ set grows — a single pass already loses about 25%. Ways out, best first:
 | `--tile` | tile edge in pixels (default 512) |
 | `--tiles-per-frame` | tiles taken from each shot (default 24) |
 | `--filter` | `bicubic-encoded` (default) or `area-linear` |
+| `--windowed` | render into a window instead of headless; needs a display |
 | `--fresh` | delete previously captured tiles first |
 | `--skip-capture` | convert an existing capture without running the game |
 

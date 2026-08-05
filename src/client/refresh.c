@@ -232,9 +232,11 @@ LOADING / SHUTDOWN
 */
 
 extern const vid_driver_t   vid_sdl;
+extern const vid_driver_t   vid_headless;
 
 static const vid_driver_t *const vid_drivers[] = {
     &vid_sdl,
+    &vid_headless,
     NULL
 };
 
@@ -328,7 +330,14 @@ void CL_InitRefresh(void)
 #endif
 		CVAR_REFRESH | CVAR_ARCHIVE);
 
-    cvar_t *vid_driver = Cvar_Get("vid_driver", "", CVAR_REFRESH);
+    cvar_t *vid_driver = Cvar_Get("vid_driver",
+#if USE_CAPTURE
+        // the capture tool has nobody watching: no window by default
+        "headless",
+#else
+        "",
+#endif
+        CVAR_REFRESH);
     vid_driver->generator = vid_driver_g;
     vid_fullscreen = Cvar_Get("vid_fullscreen", "0", CVAR_ARCHIVE);
     _vid_fullscreen = Cvar_Get("_vid_fullscreen", "1", CVAR_ARCHIVE);
