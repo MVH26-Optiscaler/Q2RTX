@@ -581,22 +581,10 @@ static void pump_events(void)
         case SDL_WINDOWEVENT:
             window_event(&event.window);
             break;
-        case SDL_KEYDOWN:
-        case SDL_KEYUP:
-            key_event(&event.key);
-            break;
-        case SDL_MOUSEMOTION:
-            if (sdl.win_width && sdl.win_height)
-                UI_MouseEvent(event.motion.x * sdl.width / sdl.win_width,
-                              event.motion.y * sdl.height / sdl.win_height);
-            break;
-        case SDL_MOUSEBUTTONDOWN:
-        case SDL_MOUSEBUTTONUP:
-            mouse_button_event(&event.button);
-            break;
-        case SDL_MOUSEWHEEL:
-            mouse_wheel_event(&event.wheel);
-            break;
+        // Keyboard and mouse events are dropped on the floor. This build drives
+        // itself and runs for hours unattended; a stray keypress in its window
+        // must not be able to open the console, move the camera or end the run.
+        // Only SDL_QUIT and window events are honoured.
         }
     }
 }

@@ -720,6 +720,20 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
 VkResult vkpt_upscaler_run_inference(void);
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
 
+// Training-data capture; see capture.c. Independent of the upscaler itself, so
+// that data can be collected on machines that cannot run inference.
+void vkpt_capture_init_cvars(void);
+void vkpt_capture_shutdown(void);
+// True between the capture_shot command and the frame that services it.
+bool vkpt_capture_pending(void);
+// Must be recorded after tone mapping, i.e. on the same image state that
+// vkpt_upscaler_do() consumes.
+void vkpt_capture_record(VkCommandBuffer cmd_buf);
+// Must be called after the command buffer holding vkpt_capture_record()'s copy
+// has been submitted; stalls on the queue and writes the tiles out.
+void vkpt_capture_writeout(void);
+unsigned vkpt_capture_tiles_written(void);
+
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);
 VkResult vkpt_bloom_create_pipelines(void);

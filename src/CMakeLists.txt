@@ -87,6 +87,7 @@ SET(HEADERS_GAME
 
 SET(SRC_CLIENT
 	client/ascii.c
+	client/capture_bot.c
 	client/console.c
 	client/cin.c
 	client/crc.c
@@ -258,6 +259,7 @@ SET(SRC_VKPT
 	refresh/vkpt/asvgf.c
 	refresh/vkpt/bloom.c
 	refresh/vkpt/bsp_mesh.c
+	refresh/vkpt/capture.c
 	refresh/vkpt/debug.c
 	refresh/vkpt/draw.c
 	refresh/vkpt/fog.c
@@ -534,6 +536,109 @@ IF (TARGET client)
             COMMENT "Copying ONNX Runtime QNN EP runtime DLLs next to client"
         )
     ENDIF()
+ENDIF()
+
+# ---------------------------------------------------------------------------
+# q2rtx_capture: the training-data collection tool.
+#
+# The same engine driven by client/capture_bot.c with nobody watching, so it is
+# built without the subsystems that only exist for a human being present: the
+# sound engine, the menus, the cinematic player, demo recording, the GTV client
+# and the HTTP downloader. client/capture_stubs.c supplies what the rest of the
+# client still calls into.
+#
+# Everything else is deliberately identical to the game -- local server, game
+# library, entity streaming, full path tracer -- because the tool has to render
+# exactly what the game renders for the captured tiles to be worth training on.
+#
+# VKPT only: the capture pass lives in the Vulkan renderer.
+# ---------------------------------------------------------------------------
+IF (IS_64_BIT AND CONFIG_VKPT_RENDERER)
+    SET(SRC_CAPTURE_CLIENT ${SRC_CLIENT})
+    LIST(REMOVE_ITEM SRC_CAPTURE_CLIENT
+        client/cin.c
+        client/demo.c
+        client/gtv.c
+        client/ui/demos.c
+        client/ui/menu.c
+        client/ui/playerconfig.c
+        client/ui/playermodels.c
+        client/ui/script.c
+        client/ui/servers.c
+        client/ui/ui.c
+        client/sound/dma.c
+        client/sound/al.c
+        client/sound/main.c
+        client/sound/mem.c
+        client/sound/ogg.c
+        client/sound/qal/fixed.c
+    )
+    LIST(APPEND SRC_CAPTURE_CLIENT client/capture_stubs.c)
+
+    # The platform audio backends go with the sound engine; the video backend
+    # stays, because the Vulkan swapchain still needs a window.
+    SET(SRC_CAPTURE_PLATFORM ${SRC_LINUX_CLIENT})
+    SET(SRC_CAPTURE_PLATFORM_WIN ${SRC_WINDOWS_CLIENT})
+    LIST(REMOVE_ITEM SRC_CAPTURE_PLATFORM unix/sound/sdl.c)
+    LIST(REMOVE_ITEM SRC_CAPTURE_PLATFORM_WIN unix/sound/sdl.c windows/wave.c)
+
+    IF(WIN32)
+        ADD_EXECUTABLE(capture WIN32
+            ${SRC_CAPTURE_CLIENT} ${HEADERS_CLIENT}
+            ${SRC_COMMON} ${HEADERS_COMMON}
+            ${SRC_REFRESH} ${SRC_SHADERS}
+            ${SRC_SHARED}
+            ${SRC_WINDOWS} ${SRC_CAPTURE_PLATFORM_WIN} ${HEADERS_WINDOWS}
+            ${SRC_SERVER} ${HEADERS_SERVER}
+            ${SRC_VKPT} ${HEADERS_VKPT}
+        )
+    ELSE()
+        ADD_EXECUTABLE(capture
+            ${SRC_CAPTURE_CLIENT} ${HEADERS_CLIENT}
+            ${SRC_COMMON} ${HEADERS_COMMON}
+            ${SRC_REFRESH} ${SRC_SHADERS}
+            ${SRC_SHARED}
+            ${SRC_LINUX} ${SRC_CAPTURE_PLATFORM}
+            ${SRC_SERVER} ${HEADERS_SERVER}
+            ${SRC_VKPT} ${HEADERS_VKPT}
+        )
+    ENDIF()
+
+    TARGET_COMPILE_DEFINITIONS(capture PRIVATE
+        USE_CLIENT=1 USE_SDL=1
+        REF_VKPT=1 USE_REF=1
+        "${COMMON_COMPILE_DEFS}")
+
+    IF (CONFIG_VKPT_ENABLE_DEVICE_GROUPS)
+        TARGET_COMPILE_DEFINITIONS(capture PRIVATE VKPT_DEVICE_GROUPS)
+    ENDIF()
+
+    TARGET_INCLUDE_DIRECTORIES(capture PRIVATE ../inc ${CMAKE_SOURCE_DIR}/extern/Vulkan-Headers/include)
+    add_dependencies(capture shaders)
+
+    TARGET_LINK_LIBRARIES(capture stb tinyobjloader z)
+    IF(WIN32)
+        TARGET_LINK_LIBRARIES(capture vulkan-1 winmm ws2_32)
+    ELSE()
+        TARGET_LINK_LIBRARIES(capture vulkan m dl rt pthread)
+    ENDIF()
+
+    IF (USE_SYSTEM_SDL2)
+        TARGET_LINK_LIBRARIES(capture SDL2)
+    ELSE()
+        TARGET_LINK_LIBRARIES(capture SDL2main SDL2-static)
+    ENDIF()
+
+    SET_TARGET_PROPERTIES(capture
+        PROPERTIES
+        OUTPUT_NAME "q2rtx_capture"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_SOURCE_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_SOURCE_DIR}"
+        DEBUG_POSTFIX ""
+    )
 ENDIF()
 
 SOURCE_GROUP("game\\sources" FILES ${SRC_GAME})

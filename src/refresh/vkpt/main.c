@@ -3352,6 +3352,11 @@ R_RenderFrame_RTX(refdef_t *fd)
 		}
 		END_PERF_MARKER(post_cmd_buf, PROFILER_TONE_MAPPING);
 
+		// Training-data capture reads the frame here, before any upscaler runs,
+		// so the tiles are native-resolution ground truth in exactly the state
+		// vkpt_upscaler_do() would have consumed. See capture.c.
+		vkpt_capture_record(post_cmd_buf);
+
 		// Skip FSR/NPU upscaling if image is going to be heavily blurred anyway (menu mode).
 		// The two are mutually exclusive alternatives for the same upscale-to-display-res step.
 		if (upscaler_owns_render_extent() && !qvk.frame_menu_mode)
@@ -3725,6 +3730,8 @@ R_EndFrame_RTX(void)
 		qvk.device_count, signal_semaphores, signal_device_indices,
 		qvk.fences_frame_sync[qvk.current_frame_index]);
 
+	// Stalls on the queue, but only on frames that actually asked for a capture.
+	vkpt_capture_writeout();
 
 #ifdef VKPT_IMAGE_DUMPS
 	if (cvar_dump_image->integer) {
@@ -3934,6 +3941,7 @@ R_Init_RTX(bool total)
 	drs_init();
 	vkpt_fsr_init_cvars();
 	vkpt_upscaler_init_cvars();
+	vkpt_capture_init_cvars();
 
 	// Minimum NVIDIA driver version - this is a cvar in case something changes in the future,
 	// and the current test no longer works.
@@ -4047,6 +4055,7 @@ R_Shutdown_RTX(bool total)
 		bsp_mesh_destroy(&vkpt_refdef.bsp_mesh_world);
 	}
 
+	vkpt_capture_shutdown();
 	vkpt_fog_shutdown();
 	vkpt_cameras_shutdown();
 	MAT_Shutdown();

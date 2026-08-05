@@ -2771,6 +2771,7 @@ static void CL_InitLocal(void)
     CL_InitTEnts();
     CL_InitDownloads();
     CL_GTV_Init();
+    CL_CaptureBot_Init();
 
     List_Init(&cl_ignore_text);
     List_Init(&cl_ignore_nick);
@@ -3382,6 +3383,10 @@ unsigned CL_Frame(unsigned msec)
         S_Update();
     }
 
+    // advance the training-data roam bot, after the render so that its settle
+    // countdown sees the frame that was just drawn
+    CL_CaptureBot_Frame(ref_frame);
+
     // check connection timeout
     CL_CheckTimeout();
 
@@ -3472,6 +3477,14 @@ void CL_Init(void)
     cl_cmdbuf.exec = exec_server_string;
 
     Cvar_Set("cl_running", "1");
+
+    // This build exists to do exactly one thing, so it does it without being
+    // asked. capture_user.cfg is the place for per-run overrides, since it is
+    // read after the tracked preset; a warning when it is absent is expected.
+    // capture_scan quits the process when the pass is over; see
+    // client/capture_bot.c.
+    Cbuf_AddText(&cmd_buffer,
+                 "exec capture_dataset.cfg\nexec capture_user.cfg\ncapture_scan_auto\n");
 }
 
 /*

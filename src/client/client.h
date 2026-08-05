@@ -729,6 +729,18 @@ void CL_SendCmd(void);
 
 
 //
+// capture_bot.c
+//
+void CL_CaptureBot_Init(void);
+// 'rendered' must say whether this client frame actually drew, since the bot
+// holds the camera still for a number of rendered frames before each shot.
+void CL_CaptureBot_Frame(bool rendered);
+// Overrides cl.viewangles and cl.localmove while the bot is driving.
+void CL_CaptureBot_UpdateCmd(void);
+bool CL_CaptureBot_Active(void);
+
+
+//
 // parse.c
 //
 

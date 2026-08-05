@@ -617,6 +617,9 @@ void CL_UpdateCmd(int msec)
     cl.localmove[0] += cl.mousemove[0];
     cl.localmove[1] += cl.mousemove[1];
 
+    // the capture bot drives instead of the human when it is running
+    CL_CaptureBot_UpdateCmd();
+
     // clamp to server defined max speed
     CL_ClampSpeed(cl.localmove);
 

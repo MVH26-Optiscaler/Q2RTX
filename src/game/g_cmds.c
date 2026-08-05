@@ -342,6 +342,54 @@ void Cmd_Noclip_f(edict_t *ent)
 
 /*
 ==================
+Cmd_SetPos_f
+
+argv(0) setpos, argv(1..3) x y z
+
+Moves the player to an absolute position. This exists for the training-data
+capture bot (client/capture_bot.c), which samples random points inside the map
+and needs the camera standing at each of them; walking or flying there would
+take most of a collection run and would still not reach sealed-off rooms.
+==================
+*/
+static void Cmd_SetPos_f(edict_t *ent)
+{
+    vec3_t  origin;
+    int     i;
+
+    if ((deathmatch->value || coop->value) && !sv_cheats->value) {
+        gi.cprintf(ent, PRINT_HIGH, "You must run the server with '+set cheats 1' to enable this command.\n");
+        return;
+    }
+
+    if (gi.argc() < 4) {
+        gi.cprintf(ent, PRINT_HIGH, "Usage: setpos <x> <y> <z>\n");
+        return;
+    }
+
+    for (i = 0; i < 3; i++)
+        origin[i] = Q_atof(gi.argv(i + 1));
+
+    // Unlinked across the move for the same reason the teleporter unlinks: the
+    // entity is briefly in two places as far as the area links are concerned.
+    gi.unlinkentity(ent);
+
+    VectorCopy(origin, ent->s.origin);
+    VectorCopy(origin, ent->s.old_origin);
+    VectorClear(ent->velocity);
+
+    // Marks the jump as a teleport rather than a prediction error, so the
+    // client snaps the view across instead of smoothing it over the whole
+    // distance -- which would drag the camera through the level for a second
+    // afterwards and ruin every frame captured during it.
+    ent->client->ps.pmove.pm_flags |= PMF_TIME_TELEPORT;
+    ent->client->ps.pmove.pm_time = 160 >> 3;
+
+    gi.linkentity(ent);
+}
+
+/*
+==================
 Cmd_Use_f
 
 Use an inventory item
@@ -899,6 +947,8 @@ void ClientCommand(edict_t *ent)
         Cmd_Notarget_f(ent);
     else if (Q_stricmp(cmd, "noclip") == 0)
         Cmd_Noclip_f(ent);
+    else if (Q_stricmp(cmd, "setpos") == 0)
+        Cmd_SetPos_f(ent);
     else if (Q_stricmp(cmd, "inven") == 0)
         Cmd_Inven_f(ent);
     else if (Q_stricmp(cmd, "invnext") == 0)
