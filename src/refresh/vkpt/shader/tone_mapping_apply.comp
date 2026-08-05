@@ -134,6 +134,13 @@ void main()
     vec3 input_color = imageLoad(IMG_TAA_OUTPUT, ipos).rgb;
     input_color /= STORAGE_SCALE_HDR;
 
+    // A NaN or Inf reaching here survives every operation below and lands on the
+    // swapchain as a white pixel, and the same texel feeds next frame's exposure
+    // through the histogram. bloom_blur.comp and bloom_composite.comp already
+    // reject these; this pass did not.
+    if(any(isnan(input_color)) || any(isinf(input_color)))
+        input_color = vec3(0);
+
     /* Apply a "colorization" effect.
      * fs_colorize.rgb is the color, fs_colorize.a is the strength
      * (with 0 being no colorization, and 1 being replacing the color.) */
@@ -188,7 +195,14 @@ void main()
 
     // Original autoexposure tonemapping application code
     // Exposure adjustment followed by Reinhard tonemapper
-    const float adapted_luminance = tonemap_buffer.adapted_luminance;
+    // Written by tone_mapping_curve.comp, which clamps it to
+    // [tm_min_luminance, tm_max_luminance]. Guard anyway: this is a divisor, and
+    // the negated comparison also catches NaN, matching what the CPU side does
+    // with prev_adapted_luminance in R_RenderFrame_RTX.
+    float adapted_luminance = tonemap_buffer.adapted_luminance;
+    if(!(adapted_luminance > 0.0))
+        adapted_luminance = 0.005;
+
     const float scaled_luminance = exp2(global_ubo.tm_exposure_bias - 2) * lum / adapted_luminance;
     // HDR: Adjust white point upward for large brightness
     const float white_point = (spec_tone_mapping_hdr != 0) ? max(global_ubo.tm_white_point, global_ubo.tm_hdr_peak_nits / 80) : global_ubo.tm_white_point;

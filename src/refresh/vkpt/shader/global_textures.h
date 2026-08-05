@@ -75,8 +75,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	IMG_DO(FSR_EASU_OUTPUT,           35, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
 	IMG_DO(FSR_RCAS_OUTPUT,           36, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
 	IMG_DO(CLEAR,                     37, R8G8B8A8_UNORM,      rgba8,   1,                   1              ) \
+	IMG_DO(NSS_OUTPUT,                38, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
 
-#define NUM_IMAGES_BASE     38
+#define NUM_IMAGES_BASE     39
 
 #define LIST_IMAGES_A_B \
 	IMG_DO(PT_VISBUF_PRIM_A,          NUM_IMAGES_BASE + 0,  R32G32_UINT,         rg32ui,  IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
@@ -109,6 +110,23 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	IMG_DO(ASVGF_HIST_COLOR_LF_COCG_B,NUM_IMAGES_BASE + 27, R16G16_SFLOAT,       rg16f,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(ASVGF_GRAD_SMPL_POS_A,     NUM_IMAGES_BASE + 28, R32_UINT,            r32ui,   IMG_WIDTH_GRAD_MGPU, IMG_HEIGHT_GRAD) \
 	IMG_DO(ASVGF_GRAD_SMPL_POS_B,     NUM_IMAGES_BASE + 29, R32_UINT,            r32ui,   IMG_WIDTH_GRAD_MGPU, IMG_HEIGHT_GRAD) \
+	/* NSS temporal upscaler state -- see upscaler.c's "NSS temporal path" section. \
+	   Both pairs are read/written by nss_pack.comp and nss_reconstruct.comp only; \
+	   every other renderer stage ignores them. The network's own feedback tensor \
+	   needs no such pair: it round-trips through the host-visible SSBO ONNX \
+	   Runtime writes it to directly (nss.buf_temporal in upscaler.c), which \
+	   nss_pack.comp reads back with a manual bilinear tap -- no GPU-image copy \
+	   or extra frame of lag. get_screen_image_extent() floors extent_screen_images \
+	   (what IMG_WIDTH/HEIGHT track) to at least the model's true output extent \
+	   (render extent at an exact 2x scale -- see nss_reconstruct.comp's header), \
+	   so plain IMG_WIDTH/HEIGHT is big enough for HISTORY_COLOR's actual valid \
+	   content; each pair's real sub-rect (render-sized for LUMA_DERIV, \
+	   render*2-sized for HISTORY_COLOR) is tracked at runtime via global_ubo \
+	   width/height, not unscaled_width/height. */ \
+	IMG_DO(NSS_LUMA_DERIV_A,          NUM_IMAGES_BASE + 30, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(NSS_LUMA_DERIV_B,          NUM_IMAGES_BASE + 31, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(NSS_HISTORY_COLOR_A,       NUM_IMAGES_BASE + 32, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(NSS_HISTORY_COLOR_B,       NUM_IMAGES_BASE + 33, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
 
 #define LIST_IMAGES_B_A \
 	IMG_DO(PT_VISBUF_PRIM_B,          NUM_IMAGES_BASE + 0,  R32G32_UINT,         rg32ui,  IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
@@ -141,8 +159,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	IMG_DO(ASVGF_HIST_COLOR_LF_COCG_A,NUM_IMAGES_BASE + 27, R16G16_SFLOAT,       rg16f,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(ASVGF_GRAD_SMPL_POS_B,     NUM_IMAGES_BASE + 28, R32_UINT,            r32ui,   IMG_WIDTH_GRAD_MGPU, IMG_HEIGHT_GRAD) \
 	IMG_DO(ASVGF_GRAD_SMPL_POS_A,     NUM_IMAGES_BASE + 29, R32_UINT,            r32ui,   IMG_WIDTH_GRAD_MGPU, IMG_HEIGHT_GRAD) \
+	IMG_DO(NSS_LUMA_DERIV_B,          NUM_IMAGES_BASE + 30, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(NSS_LUMA_DERIV_A,          NUM_IMAGES_BASE + 31, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(NSS_HISTORY_COLOR_B,       NUM_IMAGES_BASE + 32, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(NSS_HISTORY_COLOR_A,       NUM_IMAGES_BASE + 33, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
 
-#define NUM_IMAGES (NUM_IMAGES_BASE + 30) /* this really sucks but I don't know how to fix it
+#define NUM_IMAGES (NUM_IMAGES_BASE + 34) /* this really sucks but I don't know how to fix it
                                              counting with enum does not work in GLSL */
 
 // todo: make naming consistent!

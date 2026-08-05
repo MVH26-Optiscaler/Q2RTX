@@ -346,6 +346,14 @@ draw_profiler(int enable_asvgf)
 		PROFILER_DO(PROFILER_FSR_EASU, 2);
 		PROFILER_DO(PROFILER_FSR_RCAS, 2);
 	}
+	if(vkpt_upscaler_is_enabled())
+	{
+		// The NPU inference itself runs on the CPU between submits, so it can't
+		// be timed with GPU timestamps -- upscaler.c reports it separately.
+		PROFILER_DO(PROFILER_UPSCALER, 1);
+		PROFILER_DO(PROFILER_UPSCALER_PACK, 2);
+		PROFILER_DO(PROFILER_UPSCALER_UNPACK, 2);
+	}
 #undef PROFILER_DO
 
 	R_SetScale(1.0f);

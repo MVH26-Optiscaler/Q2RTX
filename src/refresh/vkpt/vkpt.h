@@ -20,7 +20,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef  __VKPT_H__
 #define  __VKPT_H__
 
-#include <vulkan/vulkan.h>
+// volk.h pulls in vulkan.h with VK_NO_PROTOTYPES and must stay above
+// SDL_vulkan.h, which only skips its own handle typedefs once VULKAN_H_ is set.
+#include <volk.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -100,6 +102,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	SHADER_MODULE_DO(QVK_MOD_FSR_EASU_FP32_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP16_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP32_COMP)                     \
+	SHADER_MODULE_DO(QVK_MOD_NSS_PACK_COMP)                          \
+	SHADER_MODULE_DO(QVK_MOD_NSS_RECONSTRUCT_COMP)                   \
 	SHADER_MODULE_DO(QVK_MOD_NORMALIZE_NORMAL_MAP_COMP)              \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_FRAG)                        \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_VERT)                        \
@@ -303,34 +307,9 @@ typedef struct QVK_s {
 
 extern QVK_t qvk;
 
-#define LIST_EXTENSIONS_ACCEL_STRUCT \
-	VK_EXTENSION_DO(vkCreateAccelerationStructureKHR) \
-	VK_EXTENSION_DO(vkDestroyAccelerationStructureKHR) \
-	VK_EXTENSION_DO(vkCmdBuildAccelerationStructuresKHR) \
-	VK_EXTENSION_DO(vkCmdCopyAccelerationStructureKHR) \
-	VK_EXTENSION_DO(vkGetAccelerationStructureDeviceAddressKHR) \
-	VK_EXTENSION_DO(vkCmdWriteAccelerationStructuresPropertiesKHR) \
-	VK_EXTENSION_DO(vkGetAccelerationStructureBuildSizesKHR) \
-	VK_EXTENSION_DO(vkGetBufferDeviceAddress) \
-
-#define LIST_EXTENSIONS_RAY_PIPELINE \
-	VK_EXTENSION_DO(vkCreateRayTracingPipelinesKHR) \
-	VK_EXTENSION_DO(vkCmdTraceRaysKHR) \
-	VK_EXTENSION_DO(vkGetRayTracingShaderGroupHandlesKHR) \
-
-#define LIST_EXTENSIONS_DEBUG \
-	VK_EXTENSION_DO(vkDebugMarkerSetObjectNameEXT) \
-
-#define LIST_EXTENSIONS_INSTANCE \
-	VK_EXTENSION_DO(vkCmdBeginDebugUtilsLabelEXT) \
-	VK_EXTENSION_DO(vkCmdEndDebugUtilsLabelEXT)
-
-#define VK_EXTENSION_DO(a) extern PFN_##a q##a;
-LIST_EXTENSIONS_ACCEL_STRUCT
-LIST_EXTENSIONS_RAY_PIPELINE
-LIST_EXTENSIONS_DEBUG
-LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
+// Extension entry points used to be declared here as q-prefixed pointers loaded
+// by hand. volk declares them all, so call them by their plain names; the ones
+// whose extension was not enabled stay NULL, same as before.
 
 #define MAX_SKY_CLUSTERS 1024
 
@@ -494,6 +473,9 @@ void create_orthographic_matrix(mat4_t matrix, float xmin, float xmax,
 	PROFILER_DO(FSR,                        1) \
 	PROFILER_DO(FSR_EASU,                   2) \
 	PROFILER_DO(FSR_RCAS,                   2) \
+	PROFILER_DO(UPSCALER,                   1) \
+	PROFILER_DO(UPSCALER_PACK,              2) \
+	PROFILER_DO(UPSCALER_UNPACK,            2) \
 	PROFILER_DO(UPDATE_ENVIRONMENT,         1) \
 	PROFILER_DO(GOD_RAYS,                   1) \
 	PROFILER_DO(GOD_RAYS_REFLECT_REFRACT,   1) \
@@ -700,6 +682,24 @@ void vkpt_fsr_update_ubo(QVKUniformBuffer_t *ubo);
 VkResult vkpt_fsr_do(VkCommandBuffer cmd_buf);
 VkResult vkpt_fsr_final_blit(VkCommandBuffer cmd_buf, bool warp);
 
+void vkpt_upscaler_init_cvars(void);
+VkResult vkpt_upscaler_initialize(void);
+VkResult vkpt_upscaler_destroy(void);
+VkResult vkpt_upscaler_create_pipelines(void);
+VkResult vkpt_upscaler_destroy_pipelines(void);
+bool vkpt_upscaler_is_enabled(void);
+// True and filled in when the NSS temporal model is loaded and active. The model
+// was exported at a single fixed input shape and cannot tile or crop to an
+// arbitrary viewsize/DRS-driven render extent, so when this returns true
+// get_render_extent() in main.c must use *out verbatim instead of its usual
+// viewsize/DRS-derived size.
+bool vkpt_upscaler_get_temporal_extent(VkExtent2D *out);
+VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
+// Must be called after the command buffer holding vkpt_upscaler_do()'s pack
+// dispatch has been submitted, and before vkpt_upscaler_final_blit().
+VkResult vkpt_upscaler_run_inference(void);
+VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
+
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);
 VkResult vkpt_bloom_create_pipelines(void);
@@ -838,14 +838,14 @@ static inline void begin_perf_marker(VkCommandBuffer command_buffer, int index)
 		.pLabelName = perf_marker_labels[index]
 	};
 
-	if (qvkCmdBeginDebugUtilsLabelEXT != NULL)
-		qvkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
+	if (vkCmdBeginDebugUtilsLabelEXT != NULL)
+		vkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
 }
 
 static inline void end_perf_marker(VkCommandBuffer command_buffer, int index)
 {
-	if (qvkCmdEndDebugUtilsLabelEXT != NULL)
-		qvkCmdEndDebugUtilsLabelEXT(command_buffer);
+	if (vkCmdEndDebugUtilsLabelEXT != NULL)
+		vkCmdEndDebugUtilsLabelEXT(command_buffer);
 
 	_VK(vkpt_profiler_query(command_buffer, index, PROFILER_STOP));
 }

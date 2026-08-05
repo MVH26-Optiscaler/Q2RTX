@@ -1,0 +1,235 @@
+/*
+Copyright (C) 2026, Q2RTX contributors.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NSS temporal upscaler, pre-process pass.
+//
+// Builds the 12-channel float32 input tensor for Arm's Neural Super Sampling
+// network (see upscaler.c's "NSS temporal path" section and
+// C:\Users\qc_de\neural-super-sampling\scenario\1_pre_process_shared.h, which
+// this is adapted from). Channel layout, order 0..11:
+//   0-2  warped history colour (rgb)
+//   3-5  current colour (rgb)
+//   6    motion detector (bounded [0,1] motion-magnitude feature)
+//   7-10 previous frame's network feedback tensor (rgba), zeroed on disocclusion
+//   11   luma derivative / instability
+// This order is dictated by the model's trained weights and must not change.
+//
+// Adaptations from Arm's reference (see the metadata note in
+// baseq2/models/nss-temporal-high-int8.metadata.json for why):
+//  - The exported graph's external tensor is float32 (QAT bakes Quantize/
+//    DequantizeLinear at the graph boundary), so this writes plain floats --
+//    none of Arm's int8 packing/quantization constants apply here.
+//  - get_render_extent() picks an already-multiple-of-8 render size for NSS,
+//    so process dims == padded dims always; Arm's reflect-padding for
+//    arbitrary display resolutions (ReflectIndex, separate _PaddedDims) does
+//    not apply.
+//  - Source colour is TEX_TAA_OUTPUT, i.e. Q2RTX's own ASVGF-denoised,
+//    tonemapped TAA output, not a raw jittered sample -- path-traced output is
+//    too noisy at low sample counts to hand the network directly. Consequently
+//    there is no "unjitter" step and no Karis tonemap/exposure round trip: the
+//    source is already display-referred [0,1] color.
+//  - Motion vectors (TEX_FLAT_MOTION) are UV-space deltas with the convention
+//    prev_uv = uv + motion (see primary_rays.rgen), the opposite sign and
+//    units from Arm's pixel-space "uv - motion*invDims".
+//  - Depth (TEX_PT_VIEW_DEPTH_A/B) is already linear view-space distance, so
+//    disocclusion is a direct relative difference -- no device-depth/
+//    projection reconstruction needed. This also replaces Arm's 4x4
+//    nearest-depth dilation + FOV-aware ComputeDepthClipInt with Q2RTX's own,
+//    simpler bounds+relative-depth rejection, matching the disocclusion
+//    handling already proven in asvgf_taau.comp rather than re-deriving
+//    Arm's separate depth-clip machinery blind.
+//  - Luma derivative uses Arm's simpler non-YCoCg fallback formula (the
+//    "#else" branch of CalculateLumaDerivative in the reference), not the
+//    ~230-line YCoCg/instability state machine the shipped "high" scenario
+//    uses. That branch's tuning is calibrated against Arm's own training
+//    distribution in ways this port cannot validate; the simpler single-
+//    channel EMA is still a genuine derivative/instability feature, just
+//    less elaborate.
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+layout(set = 2, binding = 0, std430) writeonly buffer NssInputTensorBuffer {
+	float nss_input_tensor[];
+};
+
+// The network's own feedback output (_TemporalTensor), written directly by
+// ONNX Runtime into this host-visible buffer on the CPU side after last
+// frame's inference (see upscaler.c's nss_run_inference()). Reading it back
+// here, one frame later, is simpler and one frame fresher than round-tripping
+// it through a ping-ponged GPU image the way NSS_LUMA_DERIV_A/B work: unlike
+// the derivative, this value is never computed by a Q2RTX shader, so there is
+// nothing to "write out" -- the CPU write from inference already is the
+// history. NCHW float32, [1,4,height,width], same dims as the input tensor.
+layout(set = 2, binding = 2, std430) readonly buffer NssTemporalTensorBuffer {
+	float nss_temporal_tensor[];
+};
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float DISOCCLUSION_DEPTH_REL_THRESHOLD = 0.05;
+const float DERIV_MIN = 0.05;
+const float DERIV_MAX = 0.3;
+const float DERIV_ALPHA = 0.1;
+
+vec4 fetch_feedback_texel(ivec2 p, ivec2 size)
+{
+	p = clamp(p, ivec2(0), size - 1);
+	int plane = size.x * size.y;
+	int base = p.y * size.x + p.x;
+	return vec4(
+		nss_temporal_tensor[0 * plane + base],
+		nss_temporal_tensor[1 * plane + base],
+		nss_temporal_tensor[2 * plane + base],
+		nss_temporal_tensor[3 * plane + base]
+	);
+}
+
+// Manual bilinear tap: the feedback tensor lives in a flat SSBO, not a
+// sampler, so there is no hardware filtering to lean on.
+vec4 sample_feedback_bilinear(vec2 px_render, ivec2 size)
+{
+	vec2 f = fract(px_render - 0.5);
+	ivec2 base = ivec2(floor(px_render - 0.5));
+	vec4 c00 = fetch_feedback_texel(base + ivec2(0, 0), size);
+	vec4 c10 = fetch_feedback_texel(base + ivec2(1, 0), size);
+	vec4 c01 = fetch_feedback_texel(base + ivec2(0, 1), size);
+	vec4 c11 = fetch_feedback_texel(base + ivec2(1, 1), size);
+	return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+float motion_detector(vec2 motion_uv, vec2 render_size)
+{
+	// Bounded [0,1] motion-magnitude feature. Ported directly from Arm's
+	// CalculateMotionDetector: it is a self-contained function of motion
+	// magnitude and render size, with no dependence on anything simplified
+	// above.
+	vec2 motion_px = motion_uv * render_size;
+	float k_pix_min = length(vec2(1.0) / render_size);
+	float k_pix_max = 200.0 * k_pix_min;
+	float k_pix_denom = 1.0 / max(k_pix_max - k_pix_min, 1e-7);
+	float motion_length = length(motion_px / render_size);
+	return sqrt((clamp(motion_length, k_pix_min, k_pix_max) - k_pix_min) * k_pix_denom);
+}
+
+void main()
+{
+	ivec2 render_size = ivec2(global_ubo.width, global_ubo.height);
+	ivec2 ipos = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(ipos, render_size)))
+		return;
+
+	ivec2 taa_max = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height) - 1;
+	ivec2 src = min(ipos, taa_max);
+
+	vec2 uv = (vec2(ipos) + vec2(0.5)) / vec2(render_size);
+	vec3 colour = texelFetch(TEX_TAA_OUTPUT, src, 0).rgb;
+	vec2 motion = texelFetch(TEX_FLAT_MOTION, min(ipos, ivec2(global_ubo.width, global_ubo.height) - 1), 0).xy;
+
+	// prev_uv = uv + motion (see primary_rays.rgen: motion = prev_screen_pos - inUV).
+	// Resolution-independent, so this is reused below to address both the
+	// render-sized and display-sized history buffers.
+	vec2 reproj_uv = uv + motion;
+	bool onscreen = all(greaterThanEqual(reproj_uv, vec2(0.0))) && all(lessThanEqual(reproj_uv, vec2(1.0)));
+
+	// Disocclusion: bounds check plus a relative view-depth mismatch against the
+	// nearest previous-frame depth texel, in place of Arm's FOV-aware depth-clip
+	// (see file header). Both PT_VIEW_DEPTH_A/B are linear view-space distance.
+	float depth_curr = texelFetch(TEX_PT_VIEW_DEPTH_A, ipos, 0).x;
+	ivec2 prev_px = clamp(ivec2(reproj_uv * vec2(render_size)), ivec2(0), render_size - 1);
+	float depth_prev = texelFetch(TEX_PT_VIEW_DEPTH_B, prev_px, 0).x;
+	float depth_max = max(abs(depth_curr), abs(depth_prev));
+	bool depth_ok = depth_max < 1e-4 || abs(depth_curr - depth_prev) < DISOCCLUSION_DEPTH_REL_THRESHOLD * depth_max;
+	bool disoccluded = !onscreen || !depth_ok;
+
+	// NSS_LUMA_DERIV_B is allocated at extent_screen_images (a fixed,
+	// display-sized upper bound -- see global_textures.h), which can be larger
+	// than the render-resolution sub-rect it actually uses. texture()'s
+	// implicit UV is normalized against the full allocation, not that
+	// sub-rect, so reproj_uv (normalized against render_size) has to be
+	// converted through the buffer's *real* dimensions via textureSize()
+	// rather than sampled with directly -- the same reason every other
+	// temporal read in this codebase goes through pixel coordinates
+	// (texelFetch, or sample_texture_catmull_rom's pixel-space uv) instead of
+	// a raw normalized texture() lookup.
+	vec2 reproj_px_render = reproj_uv * vec2(render_size);
+	vec2 deriv_uv = reproj_px_render / vec2(textureSize(TEX_NSS_LUMA_DERIV_B, 0));
+	// NSS_HISTORY_COLOR_B is only valid within the model's true output extent
+	// (render_size at an exact 2x scale -- see nss_reconstruct.comp's header),
+	// not the full display resolution, so reproject against that instead of
+	// unscaled_width/height.
+	vec2 history_uv = (reproj_uv * (vec2(render_size) * 2.0))
+		/ vec2(textureSize(TEX_NSS_HISTORY_COLOR_B, 0));
+
+	vec3 history = onscreen ? texture(TEX_NSS_HISTORY_COLOR_B, history_uv).rgb : colour;
+
+	vec4 feedback = onscreen ? sample_feedback_bilinear(reproj_px_render, render_size) : vec4(0.0);
+	if (disoccluded)
+		feedback = vec4(0.0);
+
+	// Single-channel luma derivative/instability EMA (Arm's simpler fallback
+	// branch -- see file header).
+	vec4 deriv_tm1 = onscreen ? texture(TEX_NSS_LUMA_DERIV_B, deriv_uv) : vec4(0.0);
+	float luma_derivative_tm1 = deriv_tm1.x;
+	float luma_tm1 = deriv_tm1.y;
+	float luma_t = dot(colour, vec3(0.2126, 0.7152, 0.0722));
+
+	float luma_derivative_t = abs(luma_t - luma_tm1);
+	float clipped = min(luma_derivative_t, DERIV_MAX);
+	clipped *= step(DERIV_MIN, luma_derivative_t);
+	float deriv_max_pow_r = 1.0 / (DERIV_MAX * sqrt(DERIV_MAX));
+	float curved = clipped * sqrt(clipped) * deriv_max_pow_r;
+
+	float applied_alpha = mix(DERIV_ALPHA, DERIV_ALPHA * 0.1,
+		clamp(luma_derivative_tm1, 0.0, DERIV_MAX) / DERIV_MAX);
+	float luma_derivative = mix(luma_derivative_tm1, curved, applied_alpha);
+	if (disoccluded)
+		luma_derivative = 0.0;
+
+	float motion_det = motion_detector(motion, vec2(render_size));
+
+	float values[12] = float[12](
+		history.r, history.g, history.b,
+		colour.r, colour.g, colour.b,
+		motion_det,
+		feedback.r, feedback.g, feedback.b, feedback.a,
+		luma_derivative
+	);
+
+	int plane = render_size.x * render_size.y;
+	int base = ipos.y * render_size.x + ipos.x;
+	for (int c = 0; c < 12; c++)
+		nss_input_tensor[c * plane + base] = values[c];
+
+	// Luma-derivative history for next frame: (derivative, luma, 0, 0), zeroed
+	// on disocclusion so ghosted instability state cannot carry across a cut.
+	vec4 deriv_out = disoccluded ? vec4(0.0) : vec4(luma_derivative, luma_t, 0.0, 0.0);
+	imageStore(IMG_NSS_LUMA_DERIV_A, ipos, deriv_out);
+}

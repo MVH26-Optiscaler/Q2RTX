@@ -153,10 +153,14 @@ float computePrefixSum(float val, const uint linear_idx)
 
 void main()
 {
-    const ivec2 ipos = ivec2(gl_GlobalInvocationID);
-    if(any(greaterThanEqual(ipos, ivec2(global_ubo.width, global_ubo.height))))
-        return;
-    
+    // This is a single 128-thread workgroup (dispatched 1,1,1) whose threads are
+    // histogram bins, not pixels. Gating it on the render extent used to drop
+    // threads width..127 out before the barrier()s in computeSharedSum/Max and
+    // computePrefixSum below -- non-uniform control flow, which leaves
+    // tonemap_buffer.curve[] and adapted_luminance undefined. It only bit at a
+    // render width under 128, which the NPU upscaler's display/scale render
+    // extent brings into reach. Every thread has to hit every barrier, so there
+    // is no per-thread early out here.
     const int linear_idx = int(gl_LocalInvocationIndex);
 
     // Read histogram and normalize. Add bias to avoid all-zero histogram.

@@ -176,8 +176,15 @@ static int IMG_DecodePCX(byte *rawdata, size_t rawlen, byte *pixels,
     // get palette
     //
     if (palette) {
-        if (rawlen < 768) {
+        if (rawlen < 769) {
             return Q_ERR_FILE_TOO_SMALL;
+        }
+        // the 768-byte palette is preceded by a 0x0C marker byte. Without this
+        // check any file whose last 768 bytes happen to parse is accepted as a
+        // palette, which silently yields garbage colors instead of a load error.
+        if (((byte *)pcx)[rawlen - 769] != 0x0C) {
+            Com_SetLastError("missing 256-color palette marker");
+            return Q_ERR_INVALID_FORMAT;
         }
         memcpy(palette, (byte *)pcx + rawlen - 768, 768);
     }
@@ -1839,6 +1846,20 @@ void IMG_GetPalette(void)
         goto fail;
     }
 
+    // An all-zero palette turns every palettized image into an opaque black
+    // silhouette, which is easy to mistake for a renderer bug. In practice it
+    // means a corrupt loose copy is shadowing the one in pak0.pak, since the
+    // game directory takes priority over pak files.
+    int nonzero = 0;
+    for (i = 0; i < 768; i++) {
+        nonzero |= pal[i];
+    }
+    if (!nonzero) {
+        Com_Error(ERR_FATAL, "%s has an all-black palette. A corrupt copy is probably "
+                  "shadowing the one in pak0.pak; use \"whereis %s\" to find it.",
+                  R_COLORMAP_PCX, R_COLORMAP_PCX);
+    }
+
     for (i = 0, src = pal; i < 255; i++, src += 3) {
         d_8to24table[i] = MakeColor(src[0], src[1], src[2], 255);
     }
@@ -1848,7 +1869,10 @@ void IMG_GetPalette(void)
     return;
 
 fail:
-    Com_Error(ERR_FATAL, "Couldn't load %s: %s", R_COLORMAP_PCX, Q_ErrorString(ret));
+    // Q_ERR_INVALID_FORMAT carries its detail in the last-error string, same as
+    // the image loading path in IMG_Load does.
+    Com_Error(ERR_FATAL, "Couldn't load %s: %s", R_COLORMAP_PCX,
+              ret == Q_ERR_INVALID_FORMAT ? Com_GetLastError() : Q_ErrorString(ret));
 }
 
 static const cmdreg_t img_cmd[] = {

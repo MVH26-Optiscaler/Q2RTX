@@ -114,6 +114,32 @@ add_library(tinyobjloader INTERFACE)
 target_include_directories(tinyobjloader INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tinyobjloader-c)
 
 #
+# volk (Vulkan meta-loader) + Vulkan headers
+#
+# volk resolves every Vulkan entry point at runtime through vkGetInstanceProcAddr,
+# so nothing links a loader import library. That is what makes Windows on ARM64
+# work: there is no official ARM64 vulkan-1.lib to link against.
+#
+# Built here rather than via add_subdirectory(volk) on purpose: volk's own
+# CMakeLists defaults VOLK_PULL_IN_VULKAN=ON and falls back to
+# find_package(Vulkan QUIET), which would quietly put an installed Vulkan SDK's
+# headers ahead of the vendored Vulkan-Headers and compile volk.c against
+# different headers than the rest of the client.
+#
+
+if (IS_64_BIT AND CONFIG_VKPT_RENDERER)
+    add_library(volk STATIC ${CMAKE_CURRENT_SOURCE_DIR}/volk/volk.c)
+    target_include_directories(volk PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/volk
+        ${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include)
+    if (NOT WIN32)
+        # volkInitialize() uses dlopen/dlsym.
+        target_link_libraries(volk PUBLIC ${CMAKE_DL_LIBS})
+    endif()
+    set_target_properties(volk PROPERTIES FOLDER extern)
+endif()
+
+#
 # openal-soft (64-bit only, not needed for the 32-bit server)
 #
 
@@ -146,4 +172,44 @@ if (IS_64_BIT)
         set_target_properties(clang-tidy-check PROPERTIES FOLDER extern/openal-soft)
         target_compile_definitions(OpenAL PUBLIC AL_LIBTYPE_STATIC)
     endif()
+endif()
+
+#
+# ONNX Runtime + Qualcomm QNN Execution Provider (NPU upscaler backend)
+#
+# Uses Microsoft's officially-supported classic/built-in QNN EP package,
+# which bundles the Qualcomm QNN backend DLLs (QnnHtp.dll etc.) directly --
+# no separate system-wide QAIRT SDK install is required to build or run.
+# Windows-ARM64 only (Snapdragon Hexagon NPU); gated off everywhere else.
+#
+
+if(USE_ORT_QNN_UPSCALER)
+    set(ONNXRUNTIME_QNN_VERSION "1.24.4")
+
+    include(FetchContent)
+    FetchContent_Declare(
+        onnxruntime_qnn
+        URL "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.QNN/${ONNXRUNTIME_QNN_VERSION}"
+        DOWNLOAD_NAME "onnxruntime_qnn.zip"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(onnxruntime_qnn)
+
+    set(ONNXRUNTIME_QNN_NATIVE_DIR "${onnxruntime_qnn_SOURCE_DIR}/runtimes/win-arm64/native")
+
+    add_library(onnxruntime_qnn INTERFACE IMPORTED GLOBAL)
+    target_include_directories(onnxruntime_qnn INTERFACE "${onnxruntime_qnn_SOURCE_DIR}/build/native/include")
+    target_link_libraries(onnxruntime_qnn INTERFACE "${ONNXRUNTIME_QNN_NATIVE_DIR}/onnxruntime.lib")
+
+    # Runtime payload that must be deployed next to the game executable:
+    # onnxruntime.dll itself, its provider-bridge DLLs
+    # (onnxruntime_providers_qnn.dll/_shared.dll), the QNN backend DLLs
+    # (QnnHtp/QnnCpu/QnnGpu/QnnSystem.dll + HTP V73/V81 stub DLLs), and the
+    # Hexagon-DSP-side skel binaries (libQnnHtpV7x/V8xSkel.so + .cat) that the
+    # HTP backend pushes to the NPU at runtime. Glob the whole native
+    # directory rather than hand-listing files, since missing any one of
+    # these breaks QNN EP session creation. src/CMakeLists.txt copies this
+    # set next to client.exe post-build.
+    file(GLOB ONNXRUNTIME_QNN_RUNTIME_DLLS "${ONNXRUNTIME_QNN_NATIVE_DIR}/*.dll" "${ONNXRUNTIME_QNN_NATIVE_DIR}/*.so" "${ONNXRUNTIME_QNN_NATIVE_DIR}/*.cat")
+    set(ONNXRUNTIME_QNN_RUNTIME_DLLS "${ONNXRUNTIME_QNN_RUNTIME_DLLS}" CACHE INTERNAL "ONNX Runtime QNN EP runtime payload to deploy next to client.exe")
 endif()

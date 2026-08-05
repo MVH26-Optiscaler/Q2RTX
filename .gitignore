@@ -47,3 +47,11 @@ baseq2/**/*.txt
 !baseq2/*.txt
 !baseq2/maps/sky/*.txt
 !baseq2/pics/flashlight_profile.png
+# The NPU upscaler model ships in the repo (it is small), but the directory
+# stays ignored by default so that staging baseq2\ from a game install cannot
+# silently import whatever model happens to be sitting there. Note the glob:
+# "baseq2/models/" would ignore the directory itself, and git cannot un-ignore a
+# file inside an ignored directory.
+baseq2/models/*
+!baseq2/models/nss-temporal-high-int8.onnx
+!baseq2/models/nss-temporal-high-int8.metadata.json
