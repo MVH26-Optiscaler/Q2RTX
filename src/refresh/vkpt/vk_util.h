@@ -20,7 +20,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef  __VK_UTIL_H__
 #define  __VK_UTIL_H__
 
-#include <vulkan/vulkan.h>
+#include <volk.h>
 
 char * sgets(char * str, int num, char const ** input);
 
@@ -98,7 +98,7 @@ const char *qvk_format_to_string(VkFormat format);
 const char *qvk_result_to_string(VkResult result);
 
 #define ATTACH_LABEL_VARIABLE(a, type) \
-	if(qvkDebugMarkerSetObjectNameEXT) { \
+	if(vkDebugMarkerSetObjectNameEXT) { \
 		/*Com_Printf("attaching object label 0x%08lx %s\n", (uint64_t) a, #a);*/ \
 		VkDebugMarkerObjectNameInfoEXT name_info = { \
 			.sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT, \
@@ -106,11 +106,11 @@ const char *qvk_result_to_string(VkResult result);
 			.objectType = VK_DEBUG_REPORT_OBJECT_TYPE_##type##_EXT, \
 			.pObjectName = #a \
 		}; \
-		qvkDebugMarkerSetObjectNameEXT(qvk.device, &name_info); \
+		vkDebugMarkerSetObjectNameEXT(qvk.device, &name_info); \
 	}
 
 #define ATTACH_LABEL_VARIABLE_NAME(a, type, name) \
-	if(qvkDebugMarkerSetObjectNameEXT) { \
+	if(vkDebugMarkerSetObjectNameEXT) { \
 		/*Com_Printf("attaching object label 0x%08lx %s\n", (uint64_t) a, name);*/ \
 		VkDebugMarkerObjectNameInfoEXT name_info = { \
 			.sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT, \
@@ -118,22 +118,22 @@ const char *qvk_result_to_string(VkResult result);
 			.objectType = VK_DEBUG_REPORT_OBJECT_TYPE_##type##_EXT, \
 			.pObjectName = name, \
 		}; \
-		qvkDebugMarkerSetObjectNameEXT(qvk.device, &name_info); \
+		vkDebugMarkerSetObjectNameEXT(qvk.device, &name_info); \
 	}
 
 #define BEGIN_CMD_LABEL(cmd_buf, label) \
-	if(qvkCmdBeginDebugUtilsLabelEXT) { \
+	if(vkCmdBeginDebugUtilsLabelEXT) { \
 		VkDebugUtilsLabelEXT label_info; \
 		label_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT; \
 		label_info.pNext = NULL; \
 		label_info.pLabelName = label; \
 		label_info.color[0] = label_info.color[1] = label_info.color[2] = label_info.color[3] = 1.0f; \
-		qvkCmdBeginDebugUtilsLabelEXT(cmd_buf, &label_info); \
+		vkCmdBeginDebugUtilsLabelEXT(cmd_buf, &label_info); \
 	}
 
 #define END_CMD_LABEL(cmd_buf) \
-	if(qvkCmdEndDebugUtilsLabelEXT) { \
-		qvkCmdEndDebugUtilsLabelEXT(cmd_buf); \
+	if(vkCmdEndDebugUtilsLabelEXT) { \
+		vkCmdEndDebugUtilsLabelEXT(cmd_buf); \
 	}
 
 static inline size_t align(size_t x, size_t alignment)

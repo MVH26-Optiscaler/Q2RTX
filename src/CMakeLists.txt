@@ -284,6 +284,7 @@ SET(SRC_VKPT
 	refresh/vkpt/device_memory_allocator.c
 	refresh/vkpt/god_rays.c
 	refresh/vkpt/conversion.c
+	refresh/vkpt/upscaler.c
 )
 
 SET(HEADERS_VKPT
@@ -332,6 +333,8 @@ set(SRC_SHADERS
 	refresh/vkpt/shader/fsr_easu_fp32.comp
 	refresh/vkpt/shader/fsr_rcas_fp16.comp
 	refresh/vkpt/shader/fsr_rcas_fp32.comp
+	refresh/vkpt/shader/upscaler_pack.comp
+	refresh/vkpt/shader/upscaler_unpack.comp
 	refresh/vkpt/shader/debug_line.frag
 	refresh/vkpt/shader/debug_line.vert
 )
@@ -361,7 +364,10 @@ IF(IS_64_BIT)
         get_filename_component(shader_ext ${s} EXT)
         compile_shader(SOURCE_FILE ${s} OUTPUT_FILE_LIST shader_bytecode OUTPUT_FILE_NAME "${shader_name}.pipeline")
         if (shader_ext STREQUAL ".rgen")
-            compile_shader(SOURCE_FILE ${s} OUTPUT_FILE_LIST shader_bytecode OUTPUT_FILE_NAME "${shader_name}.query" DEFINES "-DKHR_RAY_QUERY" STAGE "comp")
+            # OPTIMIZE: these ray-query variants compile to one big compute
+            # shader each; unoptimized they exceed the Adreno shader compiler's
+            # size limit and vkCreateComputePipelines fails with VK_ERROR_UNKNOWN.
+            compile_shader(SOURCE_FILE ${s} OUTPUT_FILE_LIST shader_bytecode OUTPUT_FILE_NAME "${shader_name}.query" DEFINES "-DKHR_RAY_QUERY" STAGE "comp" OPTIMIZE)
         endif()
     endforeach()
 
@@ -495,25 +501,30 @@ IF (TARGET client)
 
     IF (CONFIG_VKPT_RENDERER)
         TARGET_SOURCES(client PRIVATE ${SRC_VKPT} ${HEADERS_VKPT})
-        TARGET_INCLUDE_DIRECTORIES(client PRIVATE ${CMAKE_SOURCE_DIR}/extern/Vulkan-Headers/include)
-        LINK_DIRECTORIES(client PRIVATE ${CMAKE_SOURCE_DIR})
-        TARGET_COMPILE_DEFINITIONS(client PRIVATE REF_VKPT=1 USE_REF=1)
+        # volk carries the Vulkan-Headers include dir as a usage requirement and
+        # loads the loader at runtime, so no import library is linked here.
+        TARGET_LINK_LIBRARIES(client volk)
+        TARGET_COMPILE_DEFINITIONS(client PRIVATE REF_VKPT=1 USE_REF=1 VK_NO_PROTOTYPES)
         IF (CONFIG_VKPT_ENABLE_DEVICE_GROUPS)
             TARGET_COMPILE_DEFINITIONS(client PRIVATE VKPT_DEVICE_GROUPS)
         ENDIF()
         if (CONFIG_VKPT_ENABLE_IMAGE_DUMPS)
             TARGET_COMPILE_DEFINITIONS(client PRIVATE VKPT_IMAGE_DUMPS)
         ENDIF()
-        IF (WIN32)
-        TARGET_LINK_LIBRARIES(client vulkan-1)
-        ELSE ()
-        TARGET_LINK_LIBRARIES(client vulkan)
-        ENDIF()
     ENDIF()
 
     TARGET_LINK_LIBRARIES(client stb)
     TARGET_LINK_LIBRARIES(client tinyobjloader)
     TARGET_LINK_LIBRARIES(client OpenAL)
+
+    IF(USE_ORT_QNN_UPSCALER)
+        TARGET_LINK_LIBRARIES(client onnxruntime_qnn)
+        TARGET_COMPILE_DEFINITIONS(client PRIVATE USE_ORT_QNN_UPSCALER=1)
+        ADD_CUSTOM_COMMAND(TARGET client POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ONNXRUNTIME_QNN_RUNTIME_DLLS} $<TARGET_FILE_DIR:client>
+            COMMENT "Copying ONNX Runtime QNN EP runtime DLLs next to client"
+        )
+    ENDIF()
 ENDIF()
 
 SOURCE_GROUP("game\\sources" FILES ${SRC_GAME})

@@ -21,6 +21,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "vk_util.h"
 #include "refresh/images.h"
 #include "device_memory_allocator.h"
+#ifdef _WIN32
+#include <malloc.h> // alloca() -- MSVC ARM64 needs this in scope for it to resolve as an intrinsic
+#endif
 
 #include <assert.h>
 
@@ -2362,6 +2365,29 @@ LIST_IMAGES_A_B
 		}
 #endif
 
+	}
+
+	// VKPT_IMG_CLEAR is the 1x1 stand-in that vkpt_final_blit() binds as the debug
+	// line overlay on every frame that did not draw debug lines -- i.e. almost all
+	// of them. final_blit.frag composites it as
+	//   color = color * (1 - lines.a) + lines.rgb * ui_color_scale
+	// so if this image is left at whatever the freshly bound device memory happened
+	// to contain, an alpha of 1 erases the entire 3D view and replaces it with
+	// lines.rgb. Nothing else in the renderer ever writes it, so clear it here,
+	// once, right after the layout transition above.
+	{
+		const VkClearColorValue clear_color = { .float32 = { 0.f, 0.f, 0.f, 0.f } };
+		vkCmdClearColorImage(cmd_buf, qvk.images[VKPT_IMG_CLEAR],
+			VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1, &subresource_range);
+
+		IMAGE_BARRIER(cmd_buf,
+			.image = qvk.images[VKPT_IMG_CLEAR],
+			.subresourceRange = subresource_range,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		);
 	}
 
 	IMAGE_BARRIER_STAGES(cmd_buf,

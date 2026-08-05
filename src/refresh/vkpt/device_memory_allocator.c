@@ -18,7 +18,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "shared/shared.h"
 
-#include <vulkan/vulkan.h>
+#include <volk.h>
 #include <assert.h>
 
 #include "device_memory_allocator.h"

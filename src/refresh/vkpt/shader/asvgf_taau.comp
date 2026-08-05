@@ -298,7 +298,11 @@ main()
         linear_color_output = PQDecode(color_output);
     }
 
-    bool is_readback_pixel = all(equal(ipos, ivec2(global_ubo.unscaled_width / 2, global_ubo.unscaled_height / 2)));
+    // Center of the rect this pass actually writes, not of the display: the two
+    // only coincide when TAAU is the thing doing the upscaling. When FSR or the
+    // NPU upscaler is, this dispatch is render-sized and a display-space center
+    // would never be reached, leaving the readback stale forever.
+    bool is_readback_pixel = all(equal(ipos, ivec2(global_ubo.taa_output_width / 2, global_ubo.taa_output_height / 2)));
     if(is_readback_pixel)
     {
         readback.hdr_color = linear_color_output;
