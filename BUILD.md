@@ -105,10 +105,15 @@ cmake -B ./build -DCMAKE_BUILD_TYPE=Release -DCONFIG_BUILD_GLSLANG=ON
 cmake --build ./build -j"$(nproc)"
 ```
 
-All C/C++ dependencies (zlib, curl, SDL2, glslang, openal-soft) build statically from
-the submodules under `extern/`, so the only external requirement at build time is a
-compiler toolchain, CMake (>= 3.15), and the Vulkan loader / X11 / Wayland dev libraries
-that SDL2 links against. The sniper SDK Docker image already includes all of these.
+All C/C++ dependencies (zlib, curl, SDL2, glslang, openal-soft, volk) build statically
+from the submodules under `extern/`, so the only external requirement at build time is a
+compiler toolchain, CMake (>= 3.20), and the X11 / Wayland dev libraries that SDL2 links
+against. The sniper SDK Docker image already includes all of these.
+
+The Vulkan loader is *not* needed at build time: both volk and SDL2 open
+`libvulkan.so.1` at runtime, so no `libvulkan-dev` / import library is linked. Only the
+runtime loader (`libvulkan1`, already in `CPACK_DEBIAN_PACKAGE_DEPENDS`) has to be
+present on the machine that runs the game.
 
 ## Assets / running the game
 
@@ -148,13 +153,6 @@ The installed-game path is resolved in this order:
 
 Symlinks point into the installed copy, so they break if you move or uninstall it; use
 `--copy` for a self-contained `baseq2/`. To build without staging, pass `--no-deploy`.
-
-### Upscaler model (Docker builds)
-
-`./build-linux.sh --docker` additionally fetches the QuickSRNetSmall TFLite model
-(float + w8a8 variants, verified against a pinned checksum) into `baseq2/models/`, for
-the experimental LiteRT-based upscaler (`USE_LITE_RT`). Native builds skip this. To fetch
-it standalone, run `./deploy-assets.sh --with-upscaler-model`.
 
 ### Full game vs demo
 

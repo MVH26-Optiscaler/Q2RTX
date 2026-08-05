@@ -54,10 +54,7 @@
     Re-download the two Qualcomm AI Hub models - QuickSRNetSmall (flt_upscaling 2) and
     QuickSRNetLarge (flt_upscaling 3), onnx-w8a8 - into baseq2\models, verifying a
     pinned sha256 for each. Since both are committed to the repo this is only a repair
-    path; `git checkout -- baseq2/models` does the same thing faster. Counterpart to
-    deploy-assets.sh --with-upscaler-model, from the same pinned qai-hub-models release;
-    that script fetches the TFLite variants because it targets USE_LITE_RT, while
-    upscaler.c on this branch loads ONNX.
+    path; `git checkout -- baseq2/models` does the same thing faster.
 
     The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) is skipped: it is fine-tuned
     locally rather than published, so the repo is its only source.

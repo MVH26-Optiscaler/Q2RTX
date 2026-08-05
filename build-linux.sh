@@ -27,7 +27,6 @@ Options:
     -h, --help          Show this help
 
 After building, game assets are staged into baseq2/ via deploy-assets.sh (see BUILD.md).
---docker builds also fetch the QuickSRNetSmall upscaler model into baseq2/models/.
 
 Examples:
     ./build-linux.sh                     # native Release + stage assets
@@ -88,7 +87,7 @@ if [[ "$USE_DOCKER" == "1" ]]; then
     docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
         -v "$ROOT:/root/q2rtx" q2rtx-builder "$BUILD_TYPE" "${EXTRA_ARGS[@]}"
     echo "==> Build complete: ./q2rtx and ./q2rtxded"
-    run_deploy --with-upscaler-model
+    run_deploy
     exit 0
 fi
 

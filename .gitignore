@@ -10,9 +10,6 @@ game*.so
 build*/
 shader_vkpt
 CMakeCache.txt
-# Locally-generated ARM64 Vulkan loader import lib (see src/CMakeLists.txt) --
-# not an official SDK artifact, don't commit it.
-/arm64/
 *.exe
 *.ilk
 *.pdb

@@ -114,6 +114,32 @@ add_library(tinyobjloader INTERFACE)
 target_include_directories(tinyobjloader INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tinyobjloader-c)
 
 #
+# volk (Vulkan meta-loader) + Vulkan headers
+#
+# volk resolves every Vulkan entry point at runtime through vkGetInstanceProcAddr,
+# so nothing links a loader import library. That is what makes Windows on ARM64
+# work: there is no official ARM64 vulkan-1.lib to link against.
+#
+# Built here rather than via add_subdirectory(volk) on purpose: volk's own
+# CMakeLists defaults VOLK_PULL_IN_VULKAN=ON and falls back to
+# find_package(Vulkan QUIET), which would quietly put an installed Vulkan SDK's
+# headers ahead of the vendored Vulkan-Headers and compile volk.c against
+# different headers than the rest of the client.
+#
+
+if (IS_64_BIT AND CONFIG_VKPT_RENDERER)
+    add_library(volk STATIC ${CMAKE_CURRENT_SOURCE_DIR}/volk/volk.c)
+    target_include_directories(volk PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/volk
+        ${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include)
+    if (NOT WIN32)
+        # volkInitialize() uses dlopen/dlsym.
+        target_link_libraries(volk PUBLIC ${CMAKE_DL_LIBS})
+    endif()
+    set_target_properties(volk PROPERTIES FOLDER extern)
+endif()
+
+#
 # openal-soft (64-bit only, not needed for the 32-bit server)
 #
 

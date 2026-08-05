@@ -112,8 +112,6 @@ set(CMAKE_INSTALL_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/extern/install)
 
 add_subdirectory(extern)
 
-link_directories(.)
-
 set(CMAKE_INSTALL_PREFIX ${PROJECT_BINARY_DIR}/install)
 
 SET(CMAKE_INTERPROCEDURAL_OPTIMIZATION ${CONFIG_BUILD_IPO})

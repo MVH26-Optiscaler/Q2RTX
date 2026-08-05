@@ -193,7 +193,7 @@ get_buffer_device_address(VkBuffer buffer)
 	  .buffer = buffer
 	};
 
-	return qvkGetBufferDeviceAddress(qvk.device, &address_info);
+	return vkGetBufferDeviceAddress(qvk.device, &address_info);
 }
 
 const char *

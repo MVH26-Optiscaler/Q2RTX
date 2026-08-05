@@ -355,7 +355,7 @@ static void destroy_accel_struct(accel_struct_t* blas)
 
 	if (blas->accel)
 	{
-		qvkDestroyAccelerationStructureKHR(qvk.device, blas->accel, NULL);
+		vkDestroyAccelerationStructureKHR(qvk.device, blas->accel, NULL);
 		blas->accel = VK_NULL_HANDLE;
 	}
 	
@@ -487,7 +487,7 @@ vkpt_pt_create_accel_bottom(
 	// Find size to build on the device
 	uint32_t max_primitive_count = max(num_vertices, num_indices) / 3; // number of tris
 	VkAccelerationStructureBuildSizesInfoKHR sizeInfo = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
-	qvkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
+	vkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
 
 	if (doAlloc)
 	{
@@ -501,7 +501,7 @@ vkpt_pt_create_accel_bottom(
 			num_indices_to_allocate *= DYNAMIC_GEOMETRY_BLOAT_FACTOR;
 
 			max_primitive_count = max(num_vertices_to_allocate, num_indices_to_allocate) / 3;
-			qvkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
+			vkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
 		}
 
 		// Create acceleration structure
@@ -517,7 +517,7 @@ vkpt_pt_create_accel_bottom(
 		buffer_attach_name(&blas->mem, va("blas: %s", debug_label));
 
 		// Create the acceleration structure
-		qvkCreateAccelerationStructureKHR(qvk.device, &createInfo, NULL, &blas->accel);
+		vkCreateAccelerationStructureKHR(qvk.device, &createInfo, NULL, &blas->accel);
 
 		blas->match.fast_build = fast_build;
 		blas->match.vertex_count = num_vertices_to_allocate;
@@ -618,7 +618,7 @@ vkpt_pt_create_accel_bottom_aabb(
 	// Find size to build on the device
 	uint32_t max_primitive_count = num_aabbs;
 	VkAccelerationStructureBuildSizesInfoKHR sizeInfo = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
-	qvkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
+	vkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
 
 	if (doAlloc)
 	{
@@ -630,7 +630,7 @@ vkpt_pt_create_accel_bottom_aabb(
 			num_aabs_to_allocate *= DYNAMIC_GEOMETRY_BLOAT_FACTOR;
 
 			max_primitive_count = num_aabs_to_allocate;
-			qvkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
+			vkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, buildInfo, &max_primitive_count, &sizeInfo);
 		}
 
 		// Create acceleration structure
@@ -646,7 +646,7 @@ vkpt_pt_create_accel_bottom_aabb(
 		buffer_attach_name(&blas->mem, va("blas: %s", debug_label));
 
 		// Create the acceleration structure
-		qvkCreateAccelerationStructureKHR(qvk.device, &createInfo, NULL, &blas->accel);
+		vkCreateAccelerationStructureKHR(qvk.device, &createInfo, NULL, &blas->accel);
 
 		blas->match.fast_build = fast_build;
 		blas->match.vertex_count = 0;
@@ -727,7 +727,7 @@ vkpt_pt_create_all_dynamic(
 	vkpt_get_transparency_buffers(VKPT_TRANSPARENCY_SPRITES, &buffer_vertex, &offset_vertex, &buffer_index, &offset_index, &num_vertices, &num_indices);
 	vkpt_pt_create_accel_bottom(&batch, buffer_vertex, offset_vertex, buffer_index, offset_index, num_vertices, num_indices, blas_sprites + idx, true, true, "sprites");
 
-	qvkCmdBuildAccelerationStructuresKHR(cmd_buf, batch.numBuilds, batch.buildInfos, batch.rangeInfoPtrs);
+	vkCmdBuildAccelerationStructuresKHR(cmd_buf, batch.numBuilds, batch.buildInfos, batch.rangeInfoPtrs);
 
 	MEM_BARRIER_BUILD_ACCEL(cmd_buf);
 	scratch_buf_ptr = 0;
@@ -759,7 +759,7 @@ append_blas(QvkGeometryInstance_t *instances, uint32_t *num_instances, accel_str
 		.accelerationStructure = blas->accel,
 	};
 
-	instance.acceleration_structure = qvkGetAccelerationStructureDeviceAddressKHR(qvk.device, &as_device_address_info);
+	instance.acceleration_structure = vkGetAccelerationStructureDeviceAddressKHR(qvk.device, &as_device_address_info);
 	
 	assert(*num_instances < MAX_TLAS_INSTANCES);
 	memcpy(instances + *num_instances, &instance, sizeof(instance));
@@ -832,7 +832,7 @@ build_tlas(accel_build_batch_t *batch, accel_struct_t* as, VkDeviceAddress insta
 	batch->buildInfos[buildIdx] = buildInfo;
 
 	VkAccelerationStructureBuildSizesInfoKHR sizeInfo = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
-	qvkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &num_instances, &sizeInfo);
+	vkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &num_instances, &sizeInfo);
 	assert(sizeInfo.accelerationStructureSize < SIZE_SCRATCH_BUFFER);
 
 	if (!accel_matches_top_level(&as->match, true, num_instances))
@@ -855,7 +855,7 @@ build_tlas(accel_build_batch_t *batch, accel_struct_t* as, VkDeviceAddress insta
 		};
 
 		// Create the acceleration structure
-		qvkCreateAccelerationStructureKHR(qvk.device, &createInfo, NULL, &as->accel);
+		vkCreateAccelerationStructureKHR(qvk.device, &createInfo, NULL, &as->accel);
 
 		as->match.fast_build = true;
 		as->match.index_count = 0;
@@ -939,7 +939,7 @@ vkpt_pt_create_toplevel(VkCommandBuffer cmd_buf, int idx, const EntityUploadInfo
 	build_tlas(&batch, &tlas_geometry[idx], buf_instances[idx].address, num_instances_geometry);
 	build_tlas(&batch, &tlas_effects[idx], buf_instances[idx].address + num_instances_geometry * sizeof(QvkGeometryInstance_t), num_instances_effects);
 
-	qvkCmdBuildAccelerationStructuresKHR(cmd_buf, batch.numBuilds, batch.buildInfos, batch.rangeInfoPtrs);
+	vkCmdBuildAccelerationStructuresKHR(cmd_buf, batch.numBuilds, batch.buildInfos, batch.rangeInfoPtrs);
 
 	MEM_BARRIER_BUILD_ACCEL(cmd_buf); /* probably not needed here but doesn't matter */
 
@@ -1022,7 +1022,7 @@ dispatch_rays(VkCommandBuffer cmd_buf, pipeline_index_t pipeline_index, pt_push_
 			.size = 0
 		};
 
-		qvkCmdTraceRaysKHR(cmd_buf,
+		vkCmdTraceRaysKHR(cmd_buf,
 			&raygen,
 			&miss_and_hit,
 			&miss_and_hit,
@@ -1427,7 +1427,7 @@ vkpt_pt_create_pipelines()
 
 			assert(LENGTH(rt_shader_group_info) == SBT_ENTRIES_PER_PIPELINE);
 
-			VkResult res = qvkCreateRayTracingPipelinesKHR(qvk.device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &rt_pipeline_info, NULL, &rt_pipelines[index]);
+			VkResult res = vkCreateRayTracingPipelinesKHR(qvk.device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &rt_pipeline_info, NULL, &rt_pipelines[index]);
 			
 			if (res != VK_SUCCESS)
 			{
@@ -1435,7 +1435,7 @@ vkpt_pt_create_pipelines()
 				return res;
 			}
 
-			_VK(qvkGetRayTracingShaderGroupHandlesKHR(
+			_VK(vkGetRayTracingShaderGroupHandlesKHR(
 				qvk.device, rt_pipelines[index], 0, num_shader_groups,
 				/* dataSize = */ num_shader_groups * shaderGroupHandleSize,
 				/* pData = */ shader_handles + SBT_ENTRIES_PER_PIPELINE * shaderGroupHandleSize * index));

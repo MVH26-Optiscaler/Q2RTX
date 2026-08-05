@@ -82,7 +82,7 @@ void vkpt_destroy_model_geometry(model_geometry_t* info)
 
 	if (info->accel)
 	{
-		qvkDestroyAccelerationStructureKHR(qvk.device, info->accel, NULL);
+		vkDestroyAccelerationStructureKHR(qvk.device, info->accel, NULL);
 		info->accel = NULL;
 	}
 }
@@ -146,7 +146,7 @@ static void suballocate_model_blas_memory(model_geometry_t* info, size_t* vbo_si
 		.pGeometries = info->geometries
 	};
 
-	qvkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+	vkGetAccelerationStructureBuildSizesKHR(qvk.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
 		&blasBuildinfo, info->prim_counts, &info->build_sizes);
 
 	if (info->build_sizes.buildScratchSize > buf_accel_scratch.size)
@@ -178,14 +178,14 @@ static void create_model_blas(model_geometry_t* info, VkBuffer buffer, const cha
 		.size = info->build_sizes.accelerationStructureSize,
 	};
 
-	_VK(qvkCreateAccelerationStructureKHR(qvk.device, &blasCreateInfo, NULL, &info->accel));
+	_VK(vkCreateAccelerationStructureKHR(qvk.device, &blasCreateInfo, NULL, &info->accel));
 	
 	VkAccelerationStructureDeviceAddressInfoKHR  as_device_address_info = {
 		.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
 		.accelerationStructure = info->accel
 	};
 
-	info->blas_device_address = qvkGetAccelerationStructureDeviceAddressKHR(qvk.device, &as_device_address_info);
+	info->blas_device_address = vkGetAccelerationStructureDeviceAddressKHR(qvk.device, &as_device_address_info);
 
 	if (name)
 		ATTACH_LABEL_VARIABLE_NAME(info->accel, ACCELERATION_STRUCTURE_KHR, name);
@@ -225,7 +225,7 @@ static void build_model_blas(VkCommandBuffer cmd_buf, model_geometry_t* info, si
 
 	const VkAccelerationStructureBuildRangeInfoKHR* pBlasBuildRange = info->build_ranges;
 
-	qvkCmdBuildAccelerationStructuresKHR(cmd_buf, 1, &blasBuildinfo, &pBlasBuildRange);
+	vkCmdBuildAccelerationStructuresKHR(cmd_buf, 1, &blasBuildinfo, &pBlasBuildRange);
 
 	VkMemoryBarrier barrier = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

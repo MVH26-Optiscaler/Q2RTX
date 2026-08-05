@@ -45,7 +45,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "shader/vertex_buffer.h"
 
-#include <vulkan/vulkan.h>
+// Vulkan comes in through vkpt.h -> volk.h above.
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -179,7 +179,7 @@ VkptInit_t vkpt_initialization[] = {
 	{ "fsr",      vkpt_fsr_initialize,                 vkpt_fsr_destroy,                     VKPT_INIT_DEFAULT,            0 },
 	{ "fsr|",     vkpt_fsr_create_pipelines,           vkpt_fsr_destroy_pipelines,           VKPT_INIT_RELOAD_SHADER,      0 },
 	{ "upscaler",  vkpt_upscaler_initialize,           vkpt_upscaler_destroy,                VKPT_INIT_DEFAULT,            0 },
-	{ "upscaler|", vkpt_upscaler_create_pipelines,     vkpt_upscaler_destroy_pipelines,       VKPT_INIT_RELOAD_SHADER,      0 },
+	{ "upscaler|", vkpt_upscaler_create_pipelines,     vkpt_upscaler_destroy_pipelines,      VKPT_INIT_RELOAD_SHADER,      0 },
 
 	{ "physicalSky", vkpt_physical_sky_initialize,         vkpt_physical_sky_destroy,            VKPT_INIT_DEFAULT,        0 },
 	{ "physicalSky|", vkpt_physical_sky_create_pipelines,  vkpt_physical_sky_destroy_pipelines,  VKPT_INIT_RELOAD_SHADER,  0 },
@@ -424,13 +424,6 @@ QVK_t qvk = {
 	.frame_counter      = 0,
 };
 
-#define VK_EXTENSION_DO(a) PFN_##a q##a = 0;
-LIST_EXTENSIONS_ACCEL_STRUCT
-LIST_EXTENSIONS_RAY_PIPELINE
-LIST_EXTENSIONS_DEBUG
-LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
-
 const char *vk_validation_layers[] = {
 	"VK_LAYER_KHRONOS_validation"
 };
@@ -565,35 +558,6 @@ vk_debug_callback(
 
 	Com_EPrintf("\n");
 	return VK_FALSE;
-}
-
-VkResult
-qvkCreateDebugUtilsMessengerEXT(
-		VkInstance instance,
-		const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
-		const VkAllocationCallbacks* pAllocator,
-		VkDebugUtilsMessengerEXT* pCallback)
-{
-	PFN_vkCreateDebugUtilsMessengerEXT func = (PFN_vkCreateDebugUtilsMessengerEXT)
-		vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
-	if(func)
-		return func(instance, pCreateInfo, pAllocator, pCallback);
-	return VK_ERROR_EXTENSION_NOT_PRESENT;
-}
-
-VkResult
-qvkDestroyDebugUtilsMessengerEXT(
-		VkInstance instance,
-		VkDebugUtilsMessengerEXT callback,
-		const VkAllocationCallbacks* pAllocator)
-{
-	PFN_vkDestroyDebugUtilsMessengerEXT func = (PFN_vkDestroyDebugUtilsMessengerEXT)
-		vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
-	if(func) {
-		func(instance, callback, pAllocator);
-		return VK_SUCCESS;
-	}
-	return VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
 static bool pick_surface_format_hdr(picked_surface_format_t* picked_fmt, const VkSurfaceFormatKHR avail_surface_formats[], size_t num_avail_surface_formats)
@@ -878,10 +842,47 @@ append_string_list(const char** dst, uint32_t* dst_count, uint32_t dst_capacity,
 	*dst_count += src_count;
 }
 
+/*
+ * Point volk at a Vulkan loader. Every vk* symbol is a function pointer that
+ * volk fills in, so nothing here works until this has run.
+ *
+ * Deliberately re-run on every init_vulkan() (i.e. on vid_restart) rather than
+ * cached: SDL owns the loader handle we borrow below, and it is free to unload
+ * it when the Vulkan window goes away.
+ */
+static bool
+init_volk(void)
+{
+	/* Prefer the loader SDL already opened for the SDL_WINDOW_VULKAN window, so
+	 * the instance we create and the surface SDL creates come from the same one.
+	 * Matters where the loader is overridden, e.g. the Steam runtime. */
+	PFN_vkGetInstanceProcAddr get_instance_proc_addr =
+		(PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+
+	if (get_instance_proc_addr) {
+		volkInitializeCustom(get_instance_proc_addr);
+		return true;
+	}
+
+	VkResult result = volkInitialize();
+	if (result != VK_SUCCESS) {
+		Com_EPrintf("Couldn't load the Vulkan loader (vulkan-1.dll / libvulkan.so.1): %s\n"
+					"Install or update a Vulkan capable GPU driver, or run with "
+					"'+set vid_rtx 0' to use the OpenGL renderer.\n",
+					qvk_result_to_string(result));
+		return false;
+	}
+
+	return true;
+}
+
 bool
 init_vulkan(void)
 {
 	Com_Printf("----- init_vulkan -----\n");
+
+	if (!init_volk())
+		return false;
 
 	/* layers */
 	get_vk_layer_list(&qvk.num_layers, &qvk.layers);
@@ -981,11 +982,8 @@ init_vulkan(void)
 		return false;
 	}
 
-#define VK_EXTENSION_DO(a) \
-		q##a = (PFN_##a) vkGetInstanceProcAddr(qvk.instance, #a); \
-		if (!q##a) { Com_EPrintf("warning: could not load instance function %s\n", #a); }
-	LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
+	/* Bind every instance-level entry point, including the debug utils ones. */
+	volkLoadInstance(qvk.instance);
 
 	/* setup debug callback */
 	VkDebugUtilsMessengerCreateInfoEXT dbg_create_info = {
@@ -1000,7 +998,8 @@ init_vulkan(void)
 		.pUserData = NULL
 	};
 
-	_VK(qvkCreateDebugUtilsMessengerEXT(qvk.instance, &dbg_create_info, NULL, &qvk.dbg_messenger));
+	if (vkCreateDebugUtilsMessengerEXT)
+		_VK(vkCreateDebugUtilsMessengerEXT(qvk.instance, &dbg_create_info, NULL, &qvk.dbg_messenger));
 
 	/* create surface */
 	if(!SDL_Vulkan_CreateSurface(qvk.window, qvk.instance, &qvk.surface)) {
@@ -1491,26 +1490,13 @@ init_vulkan(void)
 		return false;
 	}
 
+	/* Re-bind every entry point to this device, skipping the loader's dispatch
+	 * trampolines. Entry points whose extension was not enabled above stay NULL,
+	 * which is what the guards on the ray tracing and debug marker calls expect. */
+	volkLoadDevice(qvk.device);
+
 	vkGetDeviceQueue(qvk.device, qvk.queue_idx_graphics, 0, &qvk.queue_graphics);
 	vkGetDeviceQueue(qvk.device, qvk.queue_idx_transfer, 0, &qvk.queue_transfer);
-
-#define VK_EXTENSION_DO(a) \
-	q##a = (PFN_##a) vkGetDeviceProcAddr(qvk.device, #a); \
-	if(!q##a) { Com_EPrintf("warning: could not load function %s\n", #a); }
-
-	LIST_EXTENSIONS_ACCEL_STRUCT
-
-	if (!qvk.use_ray_query)
-	{
-		LIST_EXTENSIONS_RAY_PIPELINE
-	}
-
-	if(available_optional_device_extensions[OPT_EXT_VK_EXT_DEBUG_MARKER])
-	{
-		LIST_EXTENSIONS_DEBUG
-	}
-
-#undef VK_EXTENSION_DO
 
 	Com_Printf("-----------------------\n");
 
@@ -1661,7 +1647,8 @@ destroy_vulkan(void)
 	vkDestroyCommandPool(qvk.device, qvk.cmd_buffers_transfer.command_pool, NULL);
 
 	vkDestroyDevice(qvk.device,   NULL);
-	_VK(qvkDestroyDebugUtilsMessengerEXT(qvk.instance, qvk.dbg_messenger, NULL));
+	if (vkDestroyDebugUtilsMessengerEXT)
+		vkDestroyDebugUtilsMessengerEXT(qvk.instance, qvk.dbg_messenger, NULL);
 	vkDestroyInstance(qvk.instance, NULL);
 
 	free(qvk.extensions);
@@ -1672,13 +1659,9 @@ destroy_vulkan(void)
 	qvk.layers = NULL;
 	qvk.num_layers = 0;
 
-	// Clear the extension function pointers to make sure they don't refer non-requested extensions after vid_restart
-#define VK_EXTENSION_DO(a) q##a = NULL;
-	LIST_EXTENSIONS_ACCEL_STRUCT
-	LIST_EXTENSIONS_RAY_PIPELINE
-	LIST_EXTENSIONS_DEBUG
-	LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
+	// Clear the function pointers to make sure they don't refer non-requested extensions after vid_restart.
+	// init_volk() re-populates them on the next init_vulkan().
+	volkFinalize();
 
 	return 0;
 }
@@ -3240,17 +3223,17 @@ R_RenderFrame_RTX(refdef_t *fd)
 	{
 		VkCommandBuffer lines_cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
 
-		if (qvkCmdBeginDebugUtilsLabelEXT != NULL)
+		if (vkCmdBeginDebugUtilsLabelEXT != NULL)
 		{
 			const VkDebugUtilsLabelEXT label = {
 				.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
 				.pLabelName = "debug lines"
 			};
-			qvkCmdBeginDebugUtilsLabelEXT(lines_cmd_buf, &label);
+			vkCmdBeginDebugUtilsLabelEXT(lines_cmd_buf, &label);
 		}
 		vkpt_debugdraw_draw(lines_cmd_buf);
-		if (qvkCmdEndDebugUtilsLabelEXT != NULL)
-			qvkCmdEndDebugUtilsLabelEXT(lines_cmd_buf);
+		if (vkCmdEndDebugUtilsLabelEXT != NULL)
+			vkCmdEndDebugUtilsLabelEXT(lines_cmd_buf);
 
 		vkpt_submit_command_buffer_simple(lines_cmd_buf, qvk.queue_graphics, false);
 	}

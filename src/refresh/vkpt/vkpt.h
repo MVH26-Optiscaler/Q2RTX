@@ -20,7 +20,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef  __VKPT_H__
 #define  __VKPT_H__
 
-#include <vulkan/vulkan.h>
+// volk.h pulls in vulkan.h with VK_NO_PROTOTYPES and must stay above
+// SDL_vulkan.h, which only skips its own handle typedefs once VULKAN_H_ is set.
+#include <volk.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -305,34 +307,9 @@ typedef struct QVK_s {
 
 extern QVK_t qvk;
 
-#define LIST_EXTENSIONS_ACCEL_STRUCT \
-	VK_EXTENSION_DO(vkCreateAccelerationStructureKHR) \
-	VK_EXTENSION_DO(vkDestroyAccelerationStructureKHR) \
-	VK_EXTENSION_DO(vkCmdBuildAccelerationStructuresKHR) \
-	VK_EXTENSION_DO(vkCmdCopyAccelerationStructureKHR) \
-	VK_EXTENSION_DO(vkGetAccelerationStructureDeviceAddressKHR) \
-	VK_EXTENSION_DO(vkCmdWriteAccelerationStructuresPropertiesKHR) \
-	VK_EXTENSION_DO(vkGetAccelerationStructureBuildSizesKHR) \
-	VK_EXTENSION_DO(vkGetBufferDeviceAddress) \
-
-#define LIST_EXTENSIONS_RAY_PIPELINE \
-	VK_EXTENSION_DO(vkCreateRayTracingPipelinesKHR) \
-	VK_EXTENSION_DO(vkCmdTraceRaysKHR) \
-	VK_EXTENSION_DO(vkGetRayTracingShaderGroupHandlesKHR) \
-
-#define LIST_EXTENSIONS_DEBUG \
-	VK_EXTENSION_DO(vkDebugMarkerSetObjectNameEXT) \
-
-#define LIST_EXTENSIONS_INSTANCE \
-	VK_EXTENSION_DO(vkCmdBeginDebugUtilsLabelEXT) \
-	VK_EXTENSION_DO(vkCmdEndDebugUtilsLabelEXT)
-
-#define VK_EXTENSION_DO(a) extern PFN_##a q##a;
-LIST_EXTENSIONS_ACCEL_STRUCT
-LIST_EXTENSIONS_RAY_PIPELINE
-LIST_EXTENSIONS_DEBUG
-LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
+// Extension entry points used to be declared here as q-prefixed pointers loaded
+// by hand. volk declares them all, so call them by their plain names; the ones
+// whose extension was not enabled stay NULL, same as before.
 
 #define MAX_SKY_CLUSTERS 1024
 
@@ -858,14 +835,14 @@ static inline void begin_perf_marker(VkCommandBuffer command_buffer, int index)
 		.pLabelName = perf_marker_labels[index]
 	};
 
-	if (qvkCmdBeginDebugUtilsLabelEXT != NULL)
-		qvkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
+	if (vkCmdBeginDebugUtilsLabelEXT != NULL)
+		vkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
 }
 
 static inline void end_perf_marker(VkCommandBuffer command_buffer, int index)
 {
-	if (qvkCmdEndDebugUtilsLabelEXT != NULL)
-		qvkCmdEndDebugUtilsLabelEXT(command_buffer);
+	if (vkCmdEndDebugUtilsLabelEXT != NULL)
+		vkCmdEndDebugUtilsLabelEXT(command_buffer);
 
 	_VK(vkpt_profiler_query(command_buffer, index, PROFILER_STOP));
 }

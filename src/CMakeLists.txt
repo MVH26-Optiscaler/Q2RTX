@@ -501,24 +501,15 @@ IF (TARGET client)
 
     IF (CONFIG_VKPT_RENDERER)
         TARGET_SOURCES(client PRIVATE ${SRC_VKPT} ${HEADERS_VKPT})
-        TARGET_INCLUDE_DIRECTORIES(client PRIVATE ${CMAKE_SOURCE_DIR}/extern/Vulkan-Headers/include)
-        LINK_DIRECTORIES(client PRIVATE ${CMAKE_SOURCE_DIR})
-        TARGET_COMPILE_DEFINITIONS(client PRIVATE REF_VKPT=1 USE_REF=1)
+        # volk carries the Vulkan-Headers include dir as a usage requirement and
+        # loads the loader at runtime, so no import library is linked here.
+        TARGET_LINK_LIBRARIES(client volk)
+        TARGET_COMPILE_DEFINITIONS(client PRIVATE REF_VKPT=1 USE_REF=1 VK_NO_PROTOTYPES)
         IF (CONFIG_VKPT_ENABLE_DEVICE_GROUPS)
             TARGET_COMPILE_DEFINITIONS(client PRIVATE VKPT_DEVICE_GROUPS)
         ENDIF()
         if (CONFIG_VKPT_ENABLE_IMAGE_DUMPS)
             TARGET_COMPILE_DEFINITIONS(client PRIVATE VKPT_IMAGE_DUMPS)
-        ENDIF()
-        IF (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
-        # The repo-root vulkan-1.lib is an x64 import lib; there's no official
-        # ARM64 Vulkan SDK loader lib vendored here, so use one generated from
-        # this system's own vulkan-1.dll exports (see arm64/README, if added).
-        TARGET_LINK_LIBRARIES(client ${CMAKE_SOURCE_DIR}/arm64/vulkan-1.lib)
-        ELSEIF (WIN32)
-        TARGET_LINK_LIBRARIES(client vulkan-1)
-        ELSE ()
-        TARGET_LINK_LIBRARIES(client vulkan)
         ENDIF()
     ENDIF()
 

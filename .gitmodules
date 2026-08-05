@@ -23,3 +23,6 @@
 [submodule "extern/openal-soft"]
 	path = extern/openal-soft
 	url = https://github.com/kcat/openal-soft.git
+[submodule "extern/volk"]
+	path = extern/volk
+	url = https://github.com/zeux/volk.git

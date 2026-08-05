@@ -67,10 +67,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 	Console commands
 	----------------
-	* upscaler_npu_test [seconds] - run repeated inference for the given
-	  duration (default 3s) so NPU dispatch/utilization can be confirmed via
-	  Windows Task Manager > Performance > NPU while it runs, and via the
-	  verbose ONNX Runtime log lines this prints to the console.
 	* upscaler_dump - dump the pre- and post-upscale tensor for every tile of
 	  the next rendered frame as PNGs under <gamedir>/screenshots/upscaler/,
 	  for visually inspecting what goes into and comes out of the model.
@@ -181,10 +177,14 @@ void vkpt_upscaler_init_cvars(void)
 #include "vk_util.h"
 #include "stb_image_write.h"
 
-#define UPSCALER_INPUT_NAME "image"
-#define UPSCALER_OUTPUT_NAME "upscaled_image"
+// What the QuickSRNet models shipped here call their tensors. A model that names
+// them differently still loads -- the names Run() uses are the ones queried off
+// the session -- but it is worth saying so on the console, since it usually means
+// a model was swapped in by accident.
+#define UPSCALER_EXPECTED_INPUT_NAME "image"
+#define UPSCALER_EXPECTED_OUTPUT_NAME "upscaled_image"
 #define UPSCALER_NUM_DIMS 4
-#define UPSCALER_DEFAULT_TEST_SECONDS 3
+#define UPSCALER_MAX_NAME 64
 
 // Sanity bound on the model's output tile, so a bogus model can't ask for an
 // absurd staging allocation before anything else notices.
@@ -206,6 +206,11 @@ struct
 	bool           initialized;  // env/allocator are up; safe to load models
 	bool           model_loaded;
 	int            loaded_model; // 1-based index into upscaler_models, 0 = none
+
+	// Tensor names as the loaded model declares them, not as we expect them;
+	// Run() is given these.
+	char           input_name[UPSCALER_MAX_NAME];
+	char           output_name[UPSCALER_MAX_NAME];
 
 	int64_t        input_dims[UPSCALER_NUM_DIMS];
 	int64_t        output_dims[UPSCALER_NUM_DIMS];
@@ -249,6 +254,7 @@ struct
 	// Sys_Milliseconds() is far too coarse to time a single frame's inference.
 	unsigned         inference_ms_accum;
 	unsigned         inference_frames;
+	uint64_t         inference_tiles_accum;
 } upscaler;
 
 #define UPSCALER_TIMING_INTERVAL 100 // frames between timing reports
@@ -272,8 +278,11 @@ static bool ort_ok(OrtStatus *status, const char *what)
 	return false;
 }
 
+// Queries one tensor's name, shape and element size off the session. The name is
+// copied into name_out because Run() needs it for the life of the session, while
+// the allocator's copy is freed here.
 static bool query_tensor_shape(bool is_input, size_t index, const char *expected_name,
-	int64_t *dims_out, size_t *byte_size_out)
+	char *name_out, int64_t *dims_out, size_t *byte_size_out)
 {
 	OrtAllocator *allocator;
 	if (!ort_ok(upscaler.api->GetAllocatorWithDefaultOptions(&allocator), "GetAllocatorWithDefaultOptions"))
@@ -292,6 +301,14 @@ static bool query_tensor_shape(bool is_input, size_t index, const char *expected
 	if (strcmp(name, expected_name) != 0) {
 		Com_WPrintf("upscaler: model %s %zu is named '%s', expected '%s'\n",
 			is_input ? "input" : "output", index, name, expected_name);
+	}
+
+	// Run() is given this rather than the expected name, so a model with its own
+	// naming still works. Truncation would silently misname the tensor, so reject.
+	if (Q_strlcpy(name_out, name, UPSCALER_MAX_NAME) >= UPSCALER_MAX_NAME) {
+		Com_EPrintf("upscaler: model %s %zu name '%s' is too long (max %d)\n",
+			is_input ? "input" : "output", index, name, UPSCALER_MAX_NAME - 1);
+		goto done;
 	}
 
 	status = is_input
@@ -348,76 +365,6 @@ done:
 	return ok;
 }
 
-// Phase 1 verification harness: runs repeated inference on a flat mid-gray
-// test image for the requested duration, so NPU dispatch and utilization can
-// be observed live (Task Manager > Performance > NPU) and the per-inference
-// timing can be sanity-checked against Qualcomm's published benchmarks
-// (~0.5ms for QuickSRNetSmall w8a8 on Snapdragon X Elite).
-static void Upscaler_NpuTest_f(void)
-{
-	if (!upscaler.model_loaded) {
-		Com_Printf("upscaler: NPU upscaler model not loaded, nothing to test\n");
-		return;
-	}
-
-	int duration_ms = (Cmd_Argc() > 1 ? atoi(Cmd_Argv(1)) : UPSCALER_DEFAULT_TEST_SECONDS) * 1000;
-	if (duration_ms <= 0)
-		duration_ms = UPSCALER_DEFAULT_TEST_SECONDS * 1000;
-
-	void *input_data = Z_Mallocz(upscaler.input_byte_size);
-	void *output_data = Z_Mallocz(upscaler.output_byte_size);
-	memset(input_data, 128, upscaler.input_byte_size);
-
-	OrtValue *input_value = NULL, *output_value = NULL;
-	if (!ort_ok(upscaler.api->CreateTensorWithDataAsOrtValue(upscaler.cpu_memory_info, input_data,
-			upscaler.input_byte_size, upscaler.input_dims, UPSCALER_NUM_DIMS,
-			ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, &input_value), "CreateTensorWithDataAsOrtValue(input)"))
-		goto done;
-
-	if (!ort_ok(upscaler.api->CreateTensorWithDataAsOrtValue(upscaler.cpu_memory_info, output_data,
-			upscaler.output_byte_size, upscaler.output_dims, UPSCALER_NUM_DIMS,
-			ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8, &output_value), "CreateTensorWithDataAsOrtValue(output)"))
-		goto done;
-
-	{
-		const char *input_names[]  = { UPSCALER_INPUT_NAME };
-		const char *output_names[] = { UPSCALER_OUTPUT_NAME };
-		const OrtValue *inputs[]   = { input_value };
-		OrtValue *outputs[]        = { output_value };
-
-		Com_Printf("upscaler: running NPU test inference for %d ms "
-			"(watch Task Manager > Performance > NPU)\n", duration_ms);
-
-		unsigned start = Sys_Milliseconds();
-		unsigned elapsed = 0;
-		int iterations = 0;
-		while ((int)elapsed < duration_ms) {
-			OrtStatus *status = upscaler.api->Run(upscaler.session, NULL,
-				input_names, inputs, 1, output_names, 1, outputs);
-			if (status) {
-				Com_EPrintf("upscaler: NPU test inference failed: %s\n", upscaler.api->GetErrorMessage(status));
-				upscaler.api->ReleaseStatus(status);
-				break;
-			}
-			iterations++;
-			elapsed = Sys_Milliseconds() - start;
-		}
-
-		if (iterations > 0) {
-			Com_Printf("upscaler: ran %d inferences in %u ms (avg %.3f ms/inference)\n",
-				iterations, elapsed, (double)elapsed / iterations);
-		}
-	}
-
-done:
-	if (input_value)
-		upscaler.api->ReleaseValue(input_value);
-	if (output_value)
-		upscaler.api->ReleaseValue(output_value);
-	Z_Free(input_data);
-	Z_Free(output_data);
-}
-
 // Writes one planar (NCHW, uint8, RGB) size x size tensor tile out as a PNG,
 // for visually inspecting what actually goes into/comes out of the model.
 // Triggered by the "upscaler_dump" console command via vkpt_upscaler_run_inference().
@@ -465,7 +412,6 @@ static void Upscaler_Dump_f(void)
 }
 
 static const cmdreg_t upscaler_cmds[] = {
-	{ "upscaler_npu_test", &Upscaler_NpuTest_f, NULL },
 	{ "upscaler_dump", &Upscaler_Dump_f, NULL },
 	{ NULL, NULL, NULL }
 };
@@ -535,6 +481,8 @@ static void unload_model(void)
 	upscaler.tile_in = 0;
 	upscaler.tile_out = 0;
 	upscaler.scale = 0;
+	upscaler.input_name[0] = 0;
+	upscaler.output_name[0] = 0;
 }
 
 // Loads upscaler_models[index - 1]; index 0 just unloads. Creating the session
@@ -579,8 +527,15 @@ static void load_model(int index)
 		Com_Printf("upscaler: loading %s (%s), this takes a moment...\n",
 			model_file, upscaler_models[index - 1].name);
 
+		// CreateSession takes a wide path. On failure wmodel_path would be left
+		// uninitialized stack, so don't hand it over.
 		WCHAR wmodel_path[MAX_OSPATH];
-		MultiByteToWideChar(CP_UTF8, 0, model_path, -1, wmodel_path, MAX_OSPATH);
+		if (!MultiByteToWideChar(CP_UTF8, 0, model_path, -1, wmodel_path, MAX_OSPATH)) {
+			Com_EPrintf("upscaler: could not convert model path '%s' to UTF-16 (error %lu)\n",
+				model_path, GetLastError());
+			upscaler.api->ReleaseSessionOptions(session_options);
+			return;
+		}
 
 		OrtStatus *session_status = upscaler.api->CreateSession(upscaler.env, wmodel_path, session_options, &upscaler.session);
 		upscaler.api->ReleaseSessionOptions(session_options);
@@ -593,8 +548,10 @@ static void load_model(int index)
 		}
 	}
 
-	if (!query_tensor_shape(true, 0, UPSCALER_INPUT_NAME, upscaler.input_dims, &upscaler.input_byte_size) ||
-		!query_tensor_shape(false, 0, UPSCALER_OUTPUT_NAME, upscaler.output_dims, &upscaler.output_byte_size) ||
+	if (!query_tensor_shape(true, 0, UPSCALER_EXPECTED_INPUT_NAME,
+			upscaler.input_name, upscaler.input_dims, &upscaler.input_byte_size) ||
+		!query_tensor_shape(false, 0, UPSCALER_EXPECTED_OUTPUT_NAME,
+			upscaler.output_name, upscaler.output_dims, &upscaler.output_byte_size) ||
 		!validate_tensor_geometry(model_file))
 	{
 		unload_model();
@@ -605,7 +562,7 @@ static void load_model(int index)
 	upscaler.loaded_model = index;
 
 	Com_Printf("upscaler: %s loaded, %ux%u -> %ux%u per tile; "
-		"run 'upscaler_npu_test' to verify NPU dispatch\n",
+		"set flt_upscaler_verbose 1 to verify NPU dispatch\n",
 		upscaler_models[index - 1].name,
 		upscaler.tile_in, upscaler.tile_in, upscaler.tile_out, upscaler.tile_out);
 }
@@ -1069,8 +1026,8 @@ VkResult vkpt_upscaler_run_inference(void)
 	unsigned time_begin = Sys_Milliseconds();
 
 	uint32_t num_tiles = upscaler.tiles_x * upscaler.tiles_y;
-	const char *input_names[]  = { UPSCALER_INPUT_NAME };
-	const char *output_names[] = { UPSCALER_OUTPUT_NAME };
+	const char *input_names[]  = { upscaler.input_name };
+	const char *output_names[] = { upscaler.output_name };
 	bool all_tiles_ok = true;
 
 	for (uint32_t tile = 0; tile < num_tiles; tile++)
@@ -1125,15 +1082,22 @@ VkResult vkpt_upscaler_run_inference(void)
 
 	upscaler.inference_ms_accum += Sys_Milliseconds() - time_begin;
 	upscaler.inference_frames++;
+	// Accumulated rather than taken from num_tiles at report time: the grid can
+	// change mid-interval (resolution, viewsize, DRS), and dividing a 100-frame
+	// total by the last frame's tile count would silently misreport ms/tile.
+	upscaler.inference_tiles_accum += num_tiles;
 
 	if (upscaler.inference_frames >= UPSCALER_TIMING_INTERVAL)
 	{
-		Com_Printf("upscaler: %.2f ms/frame for %u tiles (%.2f ms/tile)\n",
+		Com_Printf("upscaler: %.2f ms/frame over %u frames, %.2f tiles/frame (%.2f ms/tile)\n",
 			(double)upscaler.inference_ms_accum / upscaler.inference_frames,
-			num_tiles,
-			(double)upscaler.inference_ms_accum / (upscaler.inference_frames * num_tiles));
+			upscaler.inference_frames,
+			(double)upscaler.inference_tiles_accum / upscaler.inference_frames,
+			upscaler.inference_tiles_accum
+				? (double)upscaler.inference_ms_accum / upscaler.inference_tiles_accum : 0.0);
 		upscaler.inference_ms_accum = 0;
 		upscaler.inference_frames = 0;
+		upscaler.inference_tiles_accum = 0;
 	}
 
 	return VK_SUCCESS;

@@ -773,13 +773,24 @@ Default value is 0.
 | 3     | QuickSRNet Large               |
 | 4     | QuickSRNet Large (Q2RTX-tuned) |
 
-While an AI upscaler is selected, the render resolution is dictated by the model's
-scale factor rather than chosen: the frame is rendered at display resolution divided
-by that factor (480x270 for a 1080p display and a 4x model) so that it can be copied
-into the network's input tensor 1:1, with the right and bottom remainder padded by
-replicating the edge pixel. Resampling the frame to fit the tensor instead would feed
-the network an aliased, anisotropically squashed image. `viewsize` and the dynamic
-resolution scaling cvars therefore have no effect in these modes.
+Values 2 and above need a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64); see
+`flt_upscaler_enable`. They are listed in the menu regardless, and do nothing elsewhere.
+
+The AI models have a fixed integer scale factor, but that is a property of the model,
+not a resolution policy: `viewsize` and the dynamic resolution scaling cvars choose the
+render extent exactly as they do on every other path. The frame is then copied into the
+network's input tensors 1:1 — no resampling on the way in, with the right and bottom
+remainder of the tile grid padded by replicating the edge pixel — and the model
+multiplies it by its fixed factor. Whatever that overshoots the display by is removed on
+the way out with an area-weighted box filter.
+
+The effective downsample ratio is therefore `viewsize * scale / 100`. With a 4x model,
+`viewsize 25` lands on the display exactly and the filter collapses to a 1:1 readback:
+that is the cheap upscale-for-performance case. Above that the extra resolution is real
+supersampling, and at `viewsize 100` the path tracer runs at native resolution and the
+frame is 4x-downsampled — high quality, and far too slow for gameplay, since the number
+of serial NPU inferences grows with the square of `viewsize`. See
+`flt_upscaler_max_tiles` for the backstop on that.
 
 #### `flt_upscaler_enable`
 Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall,
@@ -795,6 +806,19 @@ execution provider is unavailable, the upscaler stays off and says so on the con
 
 Changing this reloads the ONNX Runtime session, which stalls for a few seconds while
 the QNN execution provider finalizes the model for the NPU.
+
+#### `flt_upscaler_max_tiles`
+Refuses to run the NPU upscaler on a frame that would need more than this many tiles.
+Default value is 256.
+
+The frame is covered by a grid of fixed-size tiles, one serial NPU inference each, so
+the tile count grows with the square of `viewsize` — at 1080p a 128→512 model needs 12
+tiles at `viewsize 25`, 135 at 100 and 510 at 200, the last of which would try to map
+roughly 400 MB of host-visible staging memory. The default admits the supersampling case
+and refuses the pathological one. Exceeding the limit drops the upscaling pass for that
+frame (falling back to a filtered blit) and warns on the console, rather than degrading
+the image silently or stalling for seconds. Raise it if you have the memory and the
+patience.
 
 #### `flt_upscaler_verbose`
 Raises ONNX Runtime logging to verbose, which is where the per-node execution-provider

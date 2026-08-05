@@ -19,7 +19,6 @@ set(SHADER_SOURCE_DEPENDENCIES
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/sky.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/tiny_encryption_algorithm.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/tone_mapping_utils.glsl
-    ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/upscaler_shared.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/utils.glsl
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/vertex_buffer.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/water.glsl)
