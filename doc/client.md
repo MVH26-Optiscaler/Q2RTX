@@ -765,12 +765,13 @@ Intended for testing purposes.
 Selects the upscaler shown in the video settings menu. The upscalers are mutually
 exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable` for you.
 Default value is 0.
-| Value | Upscaler         |
-| ----- | ---------------- |
-| 0     | none             |
-| 1     | AMD FSR 1.0      |
-| 2     | QuickSRNet Small |
-| 3     | QuickSRNet Large |
+| Value | Upscaler                       |
+| ----- | ------------------------------ |
+| 0     | none                           |
+| 1     | AMD FSR 1.0                    |
+| 2     | QuickSRNet Small               |
+| 3     | QuickSRNet Large               |
+| 4     | QuickSRNet Large (Q2RTX-tuned) |
 
 While an AI upscaler is selected, the render resolution is dictated by the model's
 scale factor rather than chosen: the frame is rendered at display resolution divided
@@ -781,14 +782,16 @@ the network an aliased, anisotropically squashed image. `viewsize` and the dynam
 resolution scaling cvars therefore have no effect in these modes.
 
 #### `flt_upscaler_enable`
-Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall and
-2 is QuickSRNetLarge. Default value is 0. Normally driven by `flt_upscaling` rather
+Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall,
+2 is QuickSRNetLarge and 3 is a QuickSRNetLarge fine-tuned on Quake II RTX frames,
+which trades generality for sharper results on this game's content at the same cost as
+the stock Large model. Default value is 0. Normally driven by `flt_upscaling` rather
 than set directly.
 
-Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon), and
-the model staged into `baseq2/models` — run `scripts/deploy-assets.ps1 -WithUpscalerModel`
-to fetch it from Qualcomm AI Hub. If the model is missing or the QNN execution provider
-is unavailable, the upscaler stays off and says so on the console.
+Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon). The
+models themselves ship in `baseq2/models`. If a model file is missing or the QNN
+execution provider is unavailable, the upscaler stays off and says so on the console;
+`scripts/deploy-assets.ps1 -VerifyOnly` reports which models are actually present.
 
 Changing this reloads the ONNX Runtime session, which stalls for a few seconds while
 the QNN execution provider finalizes the model for the NPU.

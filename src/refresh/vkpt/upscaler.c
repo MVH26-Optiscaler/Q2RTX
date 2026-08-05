@@ -30,18 +30,38 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	the final blit. The GPU->NPU->GPU round trip is a hard pipeline stall, which
 	is why the tile count has to stay low to be playable.
 
-	The models have static tensor shapes -- both QuickSRNetSmall and
-	QuickSRNetLarge are 1x3x128x128 uint8 in, 1x3x512x512 out -- so the frame is
-	tiled rather than fed in whole. The geometry is not hardcoded: it is queried
+	The models have static tensor shapes -- every one shipped here is
+	1x3x128x128 uint8 in, 1x3x512x512 out -- so the frame is tiled rather than
+	fed in whole. The geometry is not hardcoded: it is queried
 	off whichever model is loaded and pushed to the shaders, so swapping in a
 	model with different fixed shapes needs no code change.
+
+	Resolution
+	----------
+	The model's scale factor is a property of the model, not a resolution policy.
+	viewsize/DRS choose the render extent exactly as they do for every other path;
+	the tile grid is then sized to cover that, and the model multiplies it by its
+	fixed factor. Whatever that overshoots the display by, upscaler_unpack.comp
+	removes on the way out with an area-weighted box filter.
+
+	So the downsample ratio is viewsize * scale / 100. With a 4x model, viewsize 25
+	lands on the display exactly and the filter collapses to a 1:1 readback -- the
+	cheap upscale-for-performance case. Above that the extra resolution is real
+	supersampling, and at viewsize 100 the path tracer runs at native resolution
+	and the frame is 4x-downsampled: high quality, and far too slow for gameplay,
+	since the tile count and therefore the number of serial NPU inferences grows
+	with the square of viewsize. flt_upscaler_max_tiles is the backstop on that.
 
 	Q2RTX cvars
 	-----------
 	* flt_upscaler_enable - which model to run: 0 = disabled, 1 = QuickSRNetSmall,
-	  2 = QuickSRNetLarge (see upscaler_models[]). Changing it reloads the ONNX
+	  2 = QuickSRNetLarge, 3 = QuickSRNetLarge fine-tuned on Quake II RTX frames
+	  (see upscaler_models[]). Changing it reloads the ONNX
 	  Runtime session, which takes a few seconds because the QNN EP finalizes the
 	  HTP graph. Normally driven by the flt_upscaling menu cvar.
+	* flt_upscaler_max_tiles - refuse to run a frame needing more than this many
+	  tiles, so an over-ambitious viewsize degrades to the non-upscaled blit
+	  instead of stalling for seconds on a huge host-visible allocation.
 	* flt_upscaler_verbose - raise ONNX Runtime logging to verbose, which is
 	  where per-node execution-provider assignment is reported.
 
@@ -65,22 +85,26 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 cvar_t *cvar_flt_upscaler_enable = NULL;
 cvar_t *cvar_flt_upscaler_verbose = NULL;
+cvar_t *cvar_flt_upscaler_max_tiles = NULL;
 
 extern cvar_t *cvar_flt_fsr_enable; // owned by fsr.c, initialized just before us
 
 cvar_t *cvar_flt_upscaling = NULL;
 
-// The NPU upscaler models, indexed by flt_upscaler_enable - 1. Both are square
-// fixed-shape uint8 NCHW models from Qualcomm AI Hub, staged into
-// <gamedir>/models by scripts/deploy-assets.ps1. Order matters: it defines both
-// the flt_upscaler_enable values and the flt_upscaling values below, so append
-// rather than insert.
+// The NPU upscaler models, indexed by flt_upscaler_enable - 1. All are square
+// fixed-shape uint8 NCHW models loaded from <gamedir>/models, and all ship in
+// the repo under baseq2/models. The first two are stock w8a8 builds from
+// Qualcomm AI Hub; the third is a QuickSRNet Large fine-tuned on Quake II RTX
+// frames and re-exported with its weights embedded, so it has no .data sidecar.
+// Order matters: it defines both the flt_upscaler_enable values and the
+// flt_upscaling values below, so append rather than insert.
 static const struct {
 	const char *name;
 	const char *path;
 } upscaler_models[] = {
-	{ "QuickSRNet Small", "models/quicksrnetsmall-w8a8.onnx" },
-	{ "QuickSRNet Large", "models/quicksrnetlarge-w8a8.onnx" },
+	{ "QuickSRNet Small",               "models/quicksrnetsmall-w8a8.onnx" },
+	{ "QuickSRNet Large",               "models/quicksrnetlarge-w8a8.onnx" },
+	{ "QuickSRNet Large (Q2RTX-tuned)", "models/quicksrnetlarge-q2rtx-w8a8.onnx" },
 };
 
 // Menu-facing selector for the mutually exclusive upscalers. The per-backend
@@ -122,6 +146,16 @@ void vkpt_upscaler_init_cvars(void)
 	// which is how you confirm the model is really running on the NPU.
 	cvar_flt_upscaler_verbose = Cvar_Get("flt_upscaler_verbose", "0", 0);
 
+	// Backstop on how much work one frame may ask of the NPU. The tile count
+	// grows with the square of viewsize, and each tile is a serial inference plus
+	// its share of a host-visible staging allocation -- at 1080p a 128 -> 512
+	// model needs 12 tiles at viewsize 25 but 135 at 100 and 510 at 200, the last
+	// of which would try to map ~400 MB. The default admits the supersampling case
+	// and refuses the pathological one; raise it if you have the memory and the
+	// patience. Exceeding it drops the pass for that frame rather than degrading
+	// the image silently.
+	cvar_flt_upscaler_max_tiles = Cvar_Get("flt_upscaler_max_tiles", "256", CVAR_ARCHIVE);
+
 	// Seeded from whatever the backend cvars already say, so a config that set
 	// flt_fsr_enable or flt_upscaler_enable directly shows up correctly in the
 	// menu, on the right model.
@@ -145,7 +179,6 @@ void vkpt_upscaler_init_cvars(void)
 #include <windows.h>
 #include "onnxruntime_c_api.h"
 #include "vk_util.h"
-#include "shader/upscaler_shared.h"
 #include "stb_image_write.h"
 
 #define UPSCALER_INPUT_NAME "image"
@@ -554,7 +587,7 @@ static void load_model(int index)
 
 		if (!ort_ok(session_status, "CreateSession")) {
 			Com_Printf("upscaler: could not load %s, %s unavailable "
-				"(run scripts/deploy-assets.ps1 -WithUpscalerModel to fetch it)\n",
+				"(the models ship in baseq2/models; restore with 'git checkout -- baseq2/models')\n",
 				model_path, upscaler_models[index - 1].name);
 			return;
 		}
@@ -711,8 +744,8 @@ static void destroy_tensor_buffers(void)
 }
 
 // (Re)allocates the tensor staging buffers for the current tile grid and points
-// the descriptor set at them. The grid is derived from the output image size,
-// so this also covers resolution changes and dynamic render scaling.
+// the descriptor set at them. The grid is derived from the render extent, so
+// this also covers resolution changes, viewsize and dynamic render scaling.
 static bool ensure_tensor_buffers(uint32_t tiles_x, uint32_t tiles_y)
 {
 	if (upscaler.tiles_x == tiles_x && upscaler.tiles_y == tiles_y && upscaler.input_mapped)
@@ -912,9 +945,10 @@ bool vkpt_upscaler_is_enabled(void)
 		&& upscaler.pipelines_ready;
 }
 
-// The model's fixed scale factor, or 0 when nothing is going to run. The render
-// extent is derived from this so that the pack pass can copy the render target
-// into the tile grid 1:1 instead of resampling it.
+// The model's fixed scale factor, or 0 when nothing is going to run. This is a
+// property of the loaded model, not a resolution policy: the render extent comes
+// from viewsize/DRS like every other path, and the factor only says how much
+// bigger than that the model's output will be.
 uint32_t vkpt_upscaler_get_scale(void)
 {
 	return vkpt_upscaler_is_enabled() ? upscaler.scale : 0;
@@ -944,24 +978,42 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 	upscaler.packed_this_frame = false;
 	upscaler.tensor_valid = false;
 
-	// One tile of model output covers upscaler.tile_out pixels of the final
-	// image, so the grid is sized to cover the display and nothing more --
-	// sizing it from extent_screen_images instead would run extra inferences for
-	// pixels that are never presented.
+	// The grid is sized from the source, not from the display: pack copies the
+	// render target into it 1:1, so it has to cover exactly what pack will read
+	// and one input tile covers upscaler.tile_in pixels of it. extent_taa_output
+	// rather than extent_render because that is what pack samples, and
+	// evaluate_taa_settings() pins the two together for this mode.
 	//
-	// The render target is then copied into it 1:1 rather than resampled, which
-	// works out exactly because get_render_extent() sizes the render target at
-	// display / scale: ceil(ceil(W / scale) / tile_in) == ceil(W / tile_out), so
-	// the grid is always just big enough (4x3 tiles at 1080p with a 128 -> 512
-	// model, the last row/column part padding). On a frame where the extents
-	// have not settled yet the two can disagree, and the pack/unpack clamps
-	// degrade that to a crop or an edge smear rather than reading out of bounds.
-	VkExtent2D out = qvk.extent_unscaled;
-	uint32_t tiles_x = (out.width  + upscaler.tile_out - 1) / upscaler.tile_out;
-	uint32_t tiles_y = (out.height + upscaler.tile_out - 1) / upscaler.tile_out;
+	// The display does not participate at all. The model multiplies whatever it
+	// is given by its fixed factor, so the grid covers source * scale, which is
+	// >= the display whenever viewsize >= 100 / scale and the unpack pass
+	// resolves the difference by downsampling. At viewsize 25 with a 128 -> 512
+	// model this is 4x3 tiles at 1080p and the ratio is 1.0, i.e. the original
+	// pinned-extent behaviour falls out as a special case.
+	VkExtent2D src = qvk.extent_taa_output;
+	uint32_t tiles_x = (src.width  + upscaler.tile_in - 1) / upscaler.tile_in;
+	uint32_t tiles_y = (src.height + upscaler.tile_in - 1) / upscaler.tile_in;
 
 	if (tiles_x == 0 || tiles_y == 0)
 		return VK_SUCCESS;
+
+	// Refuse rather than try: the allocation below is host-visible and the
+	// inference loop is serial, so an over-budget frame does not degrade, it
+	// stalls for seconds or fails to map. Warn once per grid size so a config
+	// that sits over the limit does not spam every frame.
+	int max_tiles = cvar_flt_upscaler_max_tiles->integer;
+	if (max_tiles > 0 && (int)(tiles_x * tiles_y) > max_tiles)
+	{
+		static uint32_t warned_for_tiles = 0;
+		if (warned_for_tiles != tiles_x * tiles_y)
+		{
+			warned_for_tiles = tiles_x * tiles_y;
+			Com_WPrintf("NPU upscaler: %ux%u = %u tiles exceeds flt_upscaler_max_tiles (%d); "
+				"skipping. Lower viewsize or raise the limit.\n",
+				tiles_x, tiles_y, tiles_x * tiles_y, max_tiles);
+		}
+		return VK_SUCCESS;
+	}
 
 	if (!ensure_tensor_buffers(tiles_x, tiles_y))
 		return VK_SUCCESS;

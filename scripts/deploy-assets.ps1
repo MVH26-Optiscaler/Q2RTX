@@ -17,10 +17,10 @@
         digits and crosshairs - while PNG/TGA-overridden assets look fine.
 
       * An ONNX upscaler model whose external-data file is misnamed. The .onnx
-        references its weights by filename - quicksrnetsmall.data - and the model is
-        hand-placed rather than shipped, so it is easy to end up with the weights
-        saved as quicksrnetsmall-w8a8.data instead. The model then loads but its
-        weights do not.
+        references its weights by filename - quicksrnetsmall.data - so a model
+        re-fetched or hand-placed outside the committed set easily ends up with its
+        weights saved as quicksrnetsmall-w8a8.data instead. The model then loads but
+        its weights do not.
 
       * Missing ONNX Runtime / QNN runtime DLLs next to q2rtx.exe, or an exe built
         for the wrong architecture.
@@ -43,19 +43,24 @@
     Staged into baseq2\models along with the external-data file it references, under
     whatever name the model asks for.
 
-    The models are NOT part of the game and are never taken from the game install; they
-    are QuickSRNetSmall and QuickSRNetLarge builds from Qualcomm AI Hub. Use
-    -WithUpscalerModel to download them, or this parameter to stage a local copy.
-    Without either, already-staged models are still validated, and their absence is
+    The models are NOT part of the game and are never taken from the game install. All
+    three ship in the repo under baseq2\models, so you normally need neither this
+    parameter nor -WithUpscalerModel; use this one to try a model built elsewhere.
+    Models already in baseq2\models are validated either way, and an absent one is
     reported as a warning rather than an error - everything except the matching
-    flt_upscaling setting works without them.
+    flt_upscaling setting works without it.
 
 .PARAMETER WithUpscalerModel
-    Download both QuickSRNetSmall (flt_upscaling 2) and QuickSRNetLarge
-    (flt_upscaling 3), onnx-w8a8, from Qualcomm AI Hub into baseq2\models, verifying a
-    pinned sha256 for each. Counterpart to deploy-assets.sh --with-upscaler-model, from
-    the same pinned qai-hub-models release; that script fetches the TFLite variants
-    because it targets USE_LITE_RT, while upscaler.c on this branch loads ONNX.
+    Re-download the two Qualcomm AI Hub models - QuickSRNetSmall (flt_upscaling 2) and
+    QuickSRNetLarge (flt_upscaling 3), onnx-w8a8 - into baseq2\models, verifying a
+    pinned sha256 for each. Since both are committed to the repo this is only a repair
+    path; `git checkout -- baseq2/models` does the same thing faster. Counterpart to
+    deploy-assets.sh --with-upscaler-model, from the same pinned qai-hub-models release;
+    that script fetches the TFLite variants because it targets USE_LITE_RT, while
+    upscaler.c on this branch loads ONNX.
+
+    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) is skipped: it is fine-tuned
+    locally rather than published, so the repo is its only source.
 
     Note the rename asymmetry, which is what makes this fiddly to do by hand: each zip
     ships e.g. quicksrnetsmall.onnx + quicksrnetsmall.data, and the model must be
@@ -80,7 +85,8 @@
 
 .EXAMPLE
     .\scripts\deploy-assets.ps1 -WithUpscalerModel
-    Stage assets and download the NPU upscaler models, so flt_upscaling 2 and 3 work.
+    Stage assets and re-download the AI Hub upscaler models, if they were deleted from
+    baseq2\models.
 
 .EXAMPLE
     .\scripts\deploy-assets.ps1 -GameDir "D:\Games\Quake II RTX" -Mode Copy -UpscalerModel .\models
@@ -102,11 +108,17 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) -Parent
 $Baseq2   = Join-Path $RepoRoot "baseq2"
 
-# The NPU upscaler models, pinned to the same qai-hub-models release
+# The NPU upscaler models. All three are committed under baseq2\models, so a
+# fresh clone already has them; the download path below only exists to restore
+# the two AI Hub ones if they get deleted.
+#
+# The AI Hub entries are pinned to the same qai-hub-models release
 # deploy-assets.sh uses. That script fetches the TFLite variants; upscaler.c
 # loads ONNX, so we take the onnx-w8a8 zips from the same base URL. The
 # checksums guard against a mismatched or compromised download, exactly as in
-# deploy-assets.sh.
+# deploy-assets.sh. Bundled entries have no upstream to fetch from: the
+# Q2RTX-tuned model is produced locally, not published, so the repo is its only
+# source.
 #
 # Onnx is the filename upscaler.c loads relative to the game dir and Mode is the
 # flt_upscaling value that selects it; both come from upscaler_models[] in
@@ -126,16 +138,22 @@ $UpscalerModels = @(
         Sha  = "7aafb97849a90844028fd862537f8c8ff27aafef89a034939daa0e4d5f656f42"
         Onnx = "quicksrnetlarge-w8a8.onnx"
         Mode = 3
+    },
+    @{
+        Id      = "quicksrnetlarge-q2rtx"
+        Onnx    = "quicksrnetlarge-q2rtx-w8a8.onnx"
+        Mode    = 4
+        Bundled = $true
     }
 )
 
 # Built by this repo, so never staged from the installed game.
 $Excluded = @("gamex86.dll", "gamex86.pdb", "gamex86_64.dll", "gamex86_64.pdb", "shaders.pkz")
 
-# Not stock game content. Quake II RTX does not ship an NPU upscaler model - it is a
-# QAI Hub artifact that someone has to place by hand. Staging models\ from a game
-# install would silently import whatever happens to be sitting there, so the model
-# only ever comes from -UpscalerModel or from what is already in baseq2\models.
+# Not stock game content. Quake II RTX does not ship an NPU upscaler model - ours come
+# from QAI Hub or from local fine-tuning, and are committed to this repo. Staging
+# models\ from a game install would silently import whatever happens to be sitting
+# there on top of them, so that directory is never taken from the install.
 $NotStock = @("models")
 
 # Copied next to q2rtx.exe by the client POST_BUILD step (src/CMakeLists.txt:532)
@@ -260,6 +278,8 @@ function Invoke-FetchModel {
     if (-not (Test-Path -LiteralPath $modelsDir)) { $null = New-Item -ItemType Directory -Path $modelsDir }
 
     foreach ($m in $UpscalerModels) {
+        if ($m.Bundled) { Write-Item "skip  $($m.Onnx) (ships in the repo; nothing to download)"; continue }
+
         $dest = Join-Path $modelsDir $m.Onnx
         if (Test-Path -LiteralPath $dest) { Write-Item "keep  $($m.Onnx) (already present, not re-downloading)"; continue }
 
@@ -425,7 +445,12 @@ function Test-UpscalerModel {
     foreach ($m in $UpscalerModels) {
         $onnx = Join-Path $modelsDir $m.Onnx
         if (-not (Test-Path -LiteralPath $onnx)) {
-            Add-Warning "baseq2\models\$($m.Onnx) is absent; flt_upscaling $($m.Mode) will be unavailable"
+            # The repo is the only source for a bundled model, so pointing at
+            # -WithUpscalerModel would send you looking for a download that does
+            # not exist.
+            $how = "re-run with -WithUpscalerModel"
+            if ($m.Bundled) { $how = "restore it with: git checkout -- baseq2/models" }
+            Add-Warning "baseq2\models\$($m.Onnx) is absent; flt_upscaling $($m.Mode) will be unavailable ($how)"
             continue
         }
         Write-Ok "$($m.Onnx) present"

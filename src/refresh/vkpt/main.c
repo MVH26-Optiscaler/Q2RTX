@@ -238,35 +238,18 @@ static inline bool extents_equal(VkExtent2D a, VkExtent2D b)
 
 static bool is_accumulation_rendering_active(void);
 
-// The NPU upscaler owns the render extent while it runs, so everything that
-// decides whether it runs has to agree on the answer. Accumulation ("photo")
-// mode renders at full resolution over many frames for quality, which is the
-// opposite of what the upscaler is for, so it wins.
-static bool upscaler_owns_render_extent(void)
+// Whether the NPU upscaler runs this frame. It does not influence the render
+// extent -- viewsize/DRS pick that and the model scales whatever it is given --
+// but several passes still need to agree on whether it is in the frame graph.
+// Accumulation ("photo") mode renders at full resolution over many frames for
+// quality and reconstructs nothing spatially, so it wins.
+static bool upscaler_active_this_frame(void)
 {
 	return vkpt_upscaler_get_scale() > 1 && !is_accumulation_rendering_active();
 }
 
 static VkExtent2D get_render_extent(void)
 {
-	if(upscaler_owns_render_extent())
-	{
-		uint32_t upscaler_scale = vkpt_upscaler_get_scale();
-
-		// The NPU upscaler copies the render target into its tile grid 1:1
-		// rather than resampling it, so the model's fixed scale factor dictates
-		// the render extent and viewsize/DRS do not apply. Round up so the
-		// result covers the display; the unpack pass crops the few pixels of
-		// overhang when the display is not an exact multiple of the factor.
-		VkExtent2D result;
-		result.width  = (qvk.extent_unscaled.width  + upscaler_scale - 1) / upscaler_scale;
-		result.height = (qvk.extent_unscaled.height + upscaler_scale - 1) / upscaler_scale;
-
-		result.width = (result.width + 1) & ~1;
-
-		return result;
-	}
-
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -2690,11 +2673,13 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 		}
 	}
 
-	// The NPU upscaler packs the TAA output into its tile grid 1:1 and sized the
-	// render extent for exactly that, so nothing upstream may upsample first.
-	// Unconditional and last: it has to hold whatever flt_taa says, and even if
-	// FSR was also switched on behind flt_upscaling's back.
-	if (upscaler_owns_render_extent())
+	// The NPU upscaler packs the TAA output into its tile grid 1:1, so nothing
+	// upstream may upsample first: the tile grid is sized from the render extent
+	// and the unpack pass derives its source rect from extent_taa_output, so the
+	// two have to stay equal. Unconditional and last: it has to hold whatever
+	// flt_taa says, and even if FSR was also switched on behind flt_upscaling's
+	// back.
+	if (upscaler_active_this_frame())
 		qvk.extent_taa_output = qvk.extent_render;
 }
 
@@ -2893,11 +2878,29 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
 			ubo->pt_ndf_trim = 1.f;
 		}
 	}
-	else if(fsr_enabled || upscaler_owns_render_extent() || (qvk.effective_aa_mode == AA_MODE_UPSCALE))
+	else if(upscaler_active_this_frame())
+	{
+		// No LOD bias on the NPU upscaler path. The negative bias below exists to
+		// feed temporal reconstruction: TAAU renders low and resolves the extra
+		// texture detail into the display-resolution history over several frames.
+		// There is no such accumulation here -- evaluate_taa_settings() pins
+		// extent_taa_output to extent_render for exactly this mode, so TAAU runs
+		// 1:1 and the upscaling is entirely spatial. Biasing the mips sharper than
+		// the render extent can carry would only hand the model aliasing it cannot
+		// undo, which it turns into ringing. It reconstructs better from a
+		// band-limited frame.
+		//
+		// This holds across the whole viewsize range now that it selects the render
+		// extent here too: below 100% the argument above applies directly, and at or
+		// above it the frame is already supersampled, which is the branch below's
+		// clamp of resolution_scale to 1 -- the same answer by a longer route.
+		ubo->pt_texture_lod_bias = cvar_pt_texture_lod_bias->value;
+	}
+	else if(fsr_enabled || (qvk.effective_aa_mode == AA_MODE_UPSCALE))
 	{
 		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100.
-		// Taken from the extents that were actually used rather than from viewsize, which the NPU
-		// upscaler overrides; for the other paths the two are the same value.
+		// Taken from the extents that were actually used rather than from viewsize; for these
+		// paths the two are the same value.
 		float resolution_scale = (float)qvk.extent_render.width / (float)qvk.extent_unscaled.width;
 		resolution_scale = Q_clipf(resolution_scale, 0.1f, 1.f);
 		ubo->pt_texture_lod_bias = cvar_pt_texture_lod_bias->value + log2f(resolution_scale);
@@ -3354,7 +3357,7 @@ R_RenderFrame_RTX(refdef_t *fd)
 
 		// Skip FSR/NPU upscaling if image is going to be heavily blurred anyway (menu mode).
 		// The two are mutually exclusive alternatives for the same upscale-to-display-res step.
-		if (upscaler_owns_render_extent() && !qvk.frame_menu_mode)
+		if (upscaler_active_this_frame() && !qvk.frame_menu_mode)
 		{
 			vkpt_upscaler_do(post_cmd_buf);
 		}
@@ -3670,7 +3673,7 @@ R_EndFrame_RTX(void)
 	if (frame_ready)
 	{
 		bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
-		if (upscaler_owns_render_extent() && !qvk.frame_menu_mode)
+		if (upscaler_active_this_frame() && !qvk.frame_menu_mode)
 		{
 			vkpt_upscaler_final_blit(cmd_buf, waterwarp);
 		}
@@ -3681,9 +3684,10 @@ R_EndFrame_RTX(void)
 		else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
 		{
 			// TAAU normally lands this at display resolution, so an unfiltered
-			// blit is a 1:1 copy. It does not when the NPU upscaler owns the
-			// render extent and then sits out the frame (menu mode), which would
-			// leave a nearest-neighbour upscale of a quarter-resolution image.
+			// blit is a 1:1 copy. It does not when the NPU upscaler has pinned
+			// extent_taa_output to the render extent and then sits out the frame
+			// (menu mode), which would otherwise leave a nearest-neighbour
+			// upscale of the render-resolution image.
 			bool needs_filter = !extents_equal(qvk.extent_taa_output, qvk.extent_unscaled);
 			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, needs_filter, waterwarp);
 		}

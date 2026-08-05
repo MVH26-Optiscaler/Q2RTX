@@ -45,8 +45,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #define GLOBAL_TEXTURES_DESC_SET_IDX 1
 #include "global_textures.h"
 
-#include "upscaler_shared.h"
-
 layout(set = 2, binding = 0, std430) writeonly buffer InputTensorBuffer {
 	uint input_tensor[];
 };
@@ -74,11 +72,15 @@ void main()
 	uint ly     = gid.y % push.tile_in;
 	uint tile   = tile_y * push.tiles_x + tile_x;
 
-	// The render target is copied into the tile grid 1:1: get_render_extent()
-	// already sizes it at display / scale, so there is nothing to resample here.
-	// Past its right/bottom edge the tile is padded by replicating the edge
-	// texel rather than with black, which the model's receptive field would
-	// otherwise bleed inward as a dark halo along the last valid row/column.
+	// The render target is copied into the tile grid 1:1: the grid is sized to
+	// cover it in vkpt_upscaler_do(), so there is nothing to resample here. Any
+	// mismatch with the display is resolved on the way back out, by the
+	// downsample in upscaler_unpack.comp.
+	//
+	// Past the render target's right/bottom edge the tile is padded by
+	// replicating the edge texel rather than with black, which the model's
+	// receptive field would otherwise bleed inward as a dark halo along the last
+	// valid row/column.
 	//
 	// The clamp doubles as the correction for vkpt_taa() only filling the
 	// top-left extent_taa_output rect of the extent_taa_images-sized texture.
@@ -93,9 +95,12 @@ void main()
 
 		vec3 color = texelFetch(TEX_TAA_OUTPUT, min(ivec2(grid_x, grid_y), src_max), 0).rgb;
 
-		// The model was trained on display-referred sRGB images; unpack applies
-		// the inverse so the round trip is symmetric.
-		uvec3 bytes = uvec3(round(upscaler_linear_to_encoded(color) * 255.0));
+		// The tone-mapped values go to the model as they are, with no transfer
+		// curve applied. Encoding here and inverting it in unpack would hand the
+		// model something closer to the display-referred sRGB it was trained on,
+		// but a pow() on either side of the uint8 quantization loses more than
+		// the gamut mismatch costs.
+		uvec3 bytes = uvec3(round(clamp(color, vec3(0), vec3(1)) * 255.0));
 
 		packed_rgb[0] |= bytes.r << (8u * i);
 		packed_rgb[1] |= bytes.g << (8u * i);
