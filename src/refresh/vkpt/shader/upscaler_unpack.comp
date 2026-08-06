@@ -1,0 +1,152 @@
+/*
+Copyright (C) 2019, NVIDIA CORPORATION. All rights reserved.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NPU upscaler, unpack pass.
+//
+// Reads the uint8 NCHW output tensors produced by the model (1x3xtile_out x
+// tile_out per tile) back into the screen-resolution image that the final blit
+// consumes. Inverse of upscaler_pack.comp; see upscaler.c for the overview.
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+layout(set = 2, binding = 1, std430) readonly buffer OutputTensorBuffer {
+	uint output_tensor[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint tiles_x;
+	uint tiles_y;
+	uint tile_in;  // model input  edge, pixels
+	uint tile_out; // model output edge, pixels
+	uint src_width;   // rect of the source image the pack pass read
+	uint src_height;
+} push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Upper bound on the box-filter footprint per axis. The ratio is
+// viewsize * scale / 100, so this covers viewsize up to 175% with a 4x model --
+// well past the point where the tile budget in vkpt_upscaler_do() bites. It
+// exists so a transitional frame whose extents disagree cannot spin here.
+#define MAX_TAPS 8
+
+// One texel of the model output, addressed in tile-grid space.
+vec3 fetch_texel(ivec2 grid_pos)
+{
+	uint tile_x = uint(grid_pos.x) / push.tile_out;
+	uint tile_y = uint(grid_pos.y) / push.tile_out;
+	uint lx     = uint(grid_pos.x) % push.tile_out;
+	uint ly     = uint(grid_pos.y) % push.tile_out;
+	uint tile   = tile_y * push.tiles_x + tile_x;
+
+	uint plane_stride = (push.tile_out * push.tile_out) / 4u;
+
+	uint byte_index = ly * push.tile_out + lx;
+	uint base  = tile * (3u * plane_stride) + byte_index / 4u;
+	uint shift = (byte_index % 4u) * 8u;
+
+	uvec3 bytes;
+	bytes.r = (output_tensor[base + 0u * plane_stride] >> shift) & 0xffu;
+	bytes.g = (output_tensor[base + 1u * plane_stride] >> shift) & 0xffu;
+	bytes.b = (output_tensor[base + 2u * plane_stride] >> shift) & 0xffu;
+
+	// Pack quantized the tone-mapped values without a transfer curve, so the
+	// only thing to undo here is the scale.
+	return vec3(bytes) / 255.0;
+}
+
+void main()
+{
+	ivec2 ipos = ivec2(gl_GlobalInvocationID.xy);
+
+	// IMG_UPSCALE_OUTPUT is allocated at extent_screen_images, which can be
+	// larger than the display. Only the top-left display rect is written, which
+	// is exactly what final_blit.frag samples back.
+	ivec2 out_size = ivec2(global_ubo.unscaled_width, global_ubo.unscaled_height);
+
+	if (any(greaterThanEqual(ipos, out_size)))
+		return;
+
+	// Pack copied the source into the tile grid 1:1, so the meaningful part of
+	// the model output is that source scaled by the model's factor. Everything
+	// past it is tile padding grown from replicated edge texels. Same push
+	// constant pack clamped its reads to, so the two cannot disagree about what
+	// the source was -- which matters because it is not always the TAA output.
+	int scale = int(push.tile_out / push.tile_in);
+	ivec2 valid = ivec2(push.src_width, push.src_height) * scale;
+
+	// The model always multiplies by its fixed factor, so the result overshoots
+	// the display by viewsize * scale / 100 and this pass resolves the excess.
+	// Per-axis rather than one shared ratio: get_render_extent() rounds the width
+	// to even, so the two are not exactly equal. The ratio is >= 1 in practice --
+	// below that the pass would be minifying nothing and the box collapses to a
+	// single tap, which is the viewsize = 100 / scale case and reproduces the
+	// original 1:1 readback bit for bit.
+	vec2 ratio = vec2(valid) / vec2(out_size);
+
+	vec2 src_lo = vec2(ipos) * ratio;
+	vec2 src_hi = src_lo + ratio;
+
+	ivec2 first = ivec2(floor(src_lo));
+	ivec2 last  = ivec2(ceil(src_hi)) - 1;
+
+	first = clamp(first, ivec2(0), valid - 1);
+	last  = clamp(last,  first,    min(valid - 1, first + (MAX_TAPS - 1)));
+
+	// Area-weighted box: each tap contributes the overlap between its texel and
+	// the source footprint, so non-integer ratios stay smooth instead of beating
+	// against the pixel grid.
+	vec3 sum = vec3(0);
+	float total = 0;
+
+	for (int y = first.y; y <= last.y; y++)
+	{
+		float wy = min(src_hi.y, float(y + 1)) - max(src_lo.y, float(y));
+		wy = max(wy, 0.0);
+
+		for (int x = first.x; x <= last.x; x++)
+		{
+			float wx = min(src_hi.x, float(x + 1)) - max(src_lo.x, float(x));
+			wx = max(wx, 0.0);
+
+			float w = wx * wy;
+			sum += fetch_texel(ivec2(x, y)) * w;
+			total += w;
+		}
+	}
+
+	// total can only reach 0 if the footprint fell outside the clamped range,
+	// which the clamps above already prevent; the guard keeps a degenerate frame
+	// from writing NaN into the image the blit is about to sample.
+	vec3 color = (total > 0.0) ? sum / total : fetch_texel(first);
+
+	imageStore(IMG_UPSCALE_OUTPUT, ipos, vec4(color, 1));
+}

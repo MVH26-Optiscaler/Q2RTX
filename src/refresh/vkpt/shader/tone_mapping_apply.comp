@@ -37,6 +37,21 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 layout(constant_id = 0) const uint spec_tone_mapping_hdr = 0;
 
+// Pre-TAA tap variant, for the temporal NPU upscaler.
+//
+// The normal pass tone maps IMG_TAA_OUTPUT in place, so the only tone-mapped
+// image in the frame is post-TAA. A model that does its own temporal
+// reconstruction wants the frame *before* asvgf_taau touched it -- feeding it
+// TAA output double-filters, and does not match the un-antialiased jittered
+// frames it was trained on. So this variant runs the identical curve over
+// IMG_FLAT_COLOR and writes IMG_UPSCALE_INPUT, leaving TAA_OUTPUT alone for the
+// fallback blit.
+//
+// It runs in addition to the normal pass, not instead of it, and is always
+// built with spec_tone_mapping_hdr = 0: the model's output is [0,1], so there
+// is no HDR variant of this path. See upscaler.c.
+layout(constant_id = 1) const uint spec_pre_taa_tap = 0;
+
 #include "utils.glsl"
 
 #define GLOBAL_UBO_DESC_SET_IDX 0
@@ -58,6 +73,11 @@ layout(push_constant, std430) uniform PushConstants {
     float knee_w;
     float knee_a;
     float knee_b;
+    // Gates the bloom blend the tap has to do for itself, since it bypasses the
+    // bloom composite. 1 when bloom ran this frame, 0 when it did not and
+    // TEX_BLOOM_VBLUR therefore holds nothing worth reading. Unused by the
+    // normal pass, which sees bloom already composited into TAA_OUTPUT.
+    float tap_bloom;
 } push;
 
 // When tm_debug is enabled, this displays debugging information for the
@@ -125,14 +145,52 @@ vec3 srgb_dither(vec3 color, ivec2 ipos)
 void main()
 {
     ivec2 ipos = ivec2(gl_GlobalInvocationID);
-    const ivec2 screenSize = ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height);
+
+    // The tap covers the render extent, which is what FLAT_COLOR and the model
+    // input are sized to. With the upscaler active those two are equal anyway
+    // (evaluate_taa_settings pins extent_taa_output to extent_render), but the
+    // tap should not depend on that holding.
+    const ivec2 screenSize = (spec_pre_taa_tap != 0)
+        ? ivec2(global_ubo.width, global_ubo.height)
+        : ivec2(global_ubo.taa_output_width, global_ubo.taa_output_height);
 
     if(any(greaterThanEqual(ipos, screenSize)))
         return;
 
     // Get input color and luminance.
-    vec3 input_color = imageLoad(IMG_TAA_OUTPUT, ipos).rgb;
+    vec3 input_color;
+    if(spec_pre_taa_tap != 0)
+    {
+        // Pre-TAA source. Bloom composites into TAA_OUTPUT before tone mapping
+        // (see bloom_composite.comp), which this path bypasses, so replicate the
+        // same blend here rather than silently dropping bloom from the model
+        // input. Both operands are still in STORAGE_SCALE_HDR units at this
+        // point, matching the order the normal path runs them in.
+        vec4 dst = imageLoad(IMG_FLAT_COLOR, ipos);
+        if(any(isnan(dst)) || any(isinf(dst)))
+            dst = vec4(0, 0, 0, 1);
+
+        vec2 uv = clamp((vec2(ipos) + vec2(0.5)) / vec2(global_ubo.taa_image_width, global_ubo.taa_image_height), 0, 1);
+        vec4 src = textureLod(TEX_BLOOM_VBLUR, uv, 0);
+
+        src.a = 0.f;
+        dst.a = 1.f;
+
+        const vec4 blend_factor = vec4(global_ubo.bloom_intensity * push.tap_bloom);
+        input_color = (src * blend_factor + dst * (vec4(1.0) - blend_factor)).rgb;
+    }
+    else
+    {
+        input_color = imageLoad(IMG_TAA_OUTPUT, ipos).rgb;
+    }
     input_color /= STORAGE_SCALE_HDR;
+
+    // A NaN or Inf reaching here survives every operation below and lands on the
+    // swapchain as a white pixel, and the same texel feeds next frame's exposure
+    // through the histogram. bloom_blur.comp and bloom_composite.comp already
+    // reject these; this pass did not.
+    if(any(isnan(input_color)) || any(isinf(input_color)))
+        input_color = vec3(0);
 
     /* Apply a "colorization" effect.
      * fs_colorize.rgb is the color, fs_colorize.a is the strength
@@ -188,7 +246,14 @@ void main()
 
     // Original autoexposure tonemapping application code
     // Exposure adjustment followed by Reinhard tonemapper
-    const float adapted_luminance = tonemap_buffer.adapted_luminance;
+    // Written by tone_mapping_curve.comp, which clamps it to
+    // [tm_min_luminance, tm_max_luminance]. Guard anyway: this is a divisor, and
+    // the negated comparison also catches NaN, matching what the CPU side does
+    // with prev_adapted_luminance in R_RenderFrame_RTX.
+    float adapted_luminance = tonemap_buffer.adapted_luminance;
+    if(!(adapted_luminance > 0.0))
+        adapted_luminance = 0.005;
+
     const float scaled_luminance = exp2(global_ubo.tm_exposure_bias - 2) * lum / adapted_luminance;
     // HDR: Adjust white point upward for large brightness
     const float white_point = (spec_tone_mapping_hdr != 0) ? max(global_ubo.tm_white_point, global_ubo.tm_hdr_peak_nits / 80) : global_ubo.tm_white_point;
@@ -219,8 +284,11 @@ void main()
         mapped_color.rgb = apply_saturation_scale(mapped_color.rgb, global_ubo.tm_hdr_saturation_scale * 0.01);
     }
 
-    // Show tonemapping curve if enabled:
-    if(global_ubo.tm_debug != 0)
+    // Show tonemapping curve if enabled. Never on the tap: the overlay is a
+    // debug view for the displayed image, and baking it into the model input
+    // would feed the network a bar chart and then persist it through the
+    // temporal state.
+    if(global_ubo.tm_debug != 0 && spec_pre_taa_tap == 0)
     {
         vec4 bar_chart_overlay = show_bar_chart(ipos, global_ubo.tm_debug == 2);
         if(spec_tone_mapping_hdr != 0)
@@ -231,5 +299,8 @@ void main()
     }
 
     // Write out to image:
-    imageStore(IMG_TAA_OUTPUT, ipos, vec4(mapped_color, 0));
+    if(spec_pre_taa_tap != 0)
+        imageStore(IMG_UPSCALE_INPUT, ipos, vec4(mapped_color, 0));
+    else
+        imageStore(IMG_TAA_OUTPUT, ipos, vec4(mapped_color, 0));
 }

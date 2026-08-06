@@ -1,0 +1,158 @@
+/*
+Copyright (C) 2026, Q2RTX contributors.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NPU upscaler, temporal unpack pass.
+//
+// Reads the upscaled_frame region of the temporal model's float32 NCHW output
+// and writes IMG_UPSCALE_OUTPUT for the final blit. The current_state region
+// that follows it in the same buffer is not touched here -- next frame's
+// upscaler_temporal_pack.comp is what consumes that.
+//
+// There is no tile grid: the model covers the frame in one inference, so the
+// model output is exactly out_width x out_height. What does vary is how that
+// relates to the display. A temporal model runs at one extent fixed when its
+// session was created, so it pins the render extent instead of following
+// viewsize; that extent is the display divided by the model's scale and rounded
+// down to even, so the output can land on either side of the display -- hence
+// both a minifying and a magnifying path below, where the spatial unpack only
+// ever needed the former.
+//
+// See upscaler.c.
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+layout(set = 2, binding = 1, std430) readonly buffer OutputTensorBuffer {
+	float output_tensor[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint lr_width;
+	uint lr_height;
+	uint out_width;
+	uint out_height;
+	uint state_channels;
+	uint has_history;
+	float reproj_threshold;
+} push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Same bound, and for the same reason, as upscaler_unpack.comp: a transitional
+// frame whose extents disagree must not be able to spin here.
+#define MAX_TAPS 8
+
+vec3 fetch_texel(ivec2 pos)
+{
+	pos = clamp(pos, ivec2(0), ivec2(push.out_width, push.out_height) - 1);
+
+	uint plane_stride = push.out_width * push.out_height;
+	uint index = uint(pos.y) * push.out_width + uint(pos.x);
+
+	// The model emits the same tone-mapped [0,1] space it was fed, so there is
+	// no transfer curve to undo -- only the clamp, since the output dequantizes
+	// through a zero point that puts a little headroom on either side.
+	return clamp(vec3(
+		output_tensor[0u * plane_stride + index],
+		output_tensor[1u * plane_stride + index],
+		output_tensor[2u * plane_stride + index]), vec3(0), vec3(1));
+}
+
+void main()
+{
+	ivec2 ipos = ivec2(gl_GlobalInvocationID.xy);
+
+	// IMG_UPSCALE_OUTPUT is allocated at extent_screen_images, which can be
+	// larger than the display. Only the top-left display rect is written, which
+	// is exactly what final_blit.frag samples back.
+	ivec2 out_size = ivec2(global_ubo.unscaled_width, global_ubo.unscaled_height);
+
+	if (any(greaterThanEqual(ipos, out_size)))
+		return;
+
+	ivec2 valid = ivec2(push.out_width, push.out_height);
+	vec2 ratio = vec2(valid) / vec2(out_size);
+
+	vec3 color;
+
+	if (all(greaterThanEqual(ratio, vec2(1.0))))
+	{
+		// Minifying: area-weighted box, each tap contributing the overlap between
+		// its texel and the source footprint, so non-integer ratios stay smooth
+		// instead of beating against the pixel grid. At ratio 1.0 the footprint is
+		// one texel and this collapses to an exact 1:1 readback.
+		vec2 src_lo = vec2(ipos) * ratio;
+		vec2 src_hi = src_lo + ratio;
+
+		ivec2 first = ivec2(floor(src_lo));
+		ivec2 last  = ivec2(ceil(src_hi)) - 1;
+
+		first = clamp(first, ivec2(0), valid - 1);
+		last  = clamp(last,  first,    min(valid - 1, first + (MAX_TAPS - 1)));
+
+		vec3 sum = vec3(0);
+		float total = 0;
+
+		for (int y = first.y; y <= last.y; y++)
+		{
+			float wy = max(min(src_hi.y, float(y + 1)) - max(src_lo.y, float(y)), 0.0);
+
+			for (int x = first.x; x <= last.x; x++)
+			{
+				float wx = max(min(src_hi.x, float(x + 1)) - max(src_lo.x, float(x)), 0.0);
+
+				float w = wx * wy;
+				sum += fetch_texel(ivec2(x, y)) * w;
+				total += w;
+			}
+		}
+
+		color = (total > 0.0) ? sum / total : fetch_texel(first);
+	}
+	else
+	{
+		// Magnifying: the box degenerates to a single tap and would show the model
+		// output nearest-neighbour, so filter instead. Reached whenever the display
+		// is larger than the extent the model was exported at.
+		vec2 src = (vec2(ipos) + vec2(0.5)) * ratio - vec2(0.5);
+
+		ivec2 p0 = ivec2(floor(src));
+		vec2  f  = src - vec2(p0);
+
+		vec3 c00 = fetch_texel(p0 + ivec2(0, 0));
+		vec3 c10 = fetch_texel(p0 + ivec2(1, 0));
+		vec3 c01 = fetch_texel(p0 + ivec2(0, 1));
+		vec3 c11 = fetch_texel(p0 + ivec2(1, 1));
+
+		color = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+	}
+
+	imageStore(IMG_UPSCALE_OUTPUT, ipos, vec4(color, 1));
+}

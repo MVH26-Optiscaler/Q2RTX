@@ -9,6 +9,10 @@ game*.so
 *.swp
 build*/
 shader_vkpt
+CMakeCache.txt
+# Locally-generated ARM64 Vulkan loader import lib (see src/CMakeLists.txt) --
+# not an official SDK artifact, don't commit it.
+/arm64/
 *.exe
 *.ilk
 *.pdb
@@ -42,8 +46,24 @@ music/
 
 q2config.cfg
 save
+captures/
+*.gfxr
 */docs
 baseq2/**/*.txt
 !baseq2/*.txt
 !baseq2/maps/sky/*.txt
 !baseq2/pics/flashlight_profile.png
+# The NPU upscaler models ship in the repo (they are small), but the directory
+# stays ignored by default so that staging baseq2\ from a game install cannot
+# silently import whatever model happens to be sitting there. Note the glob:
+# "baseq2/models/" would ignore the directory itself, and git cannot un-ignore a
+# file inside an ignored directory.
+baseq2/models/*
+!baseq2/models/quicksrnetsmall-w8a8.onnx
+!baseq2/models/quicksrnetsmall.data
+!baseq2/models/quicksrnetlarge-w8a8.onnx
+!baseq2/models/quicksrnetlarge.data
+!baseq2/models/quicksrnetlarge-w8a8.metadata.json
+!baseq2/models/quicksrnetlarge-q2rtx-w8a8.onnx
+!baseq2/models/compact-temporal-2x-hardgate-w8a8.onnx
+!baseq2/models/compact-temporal-2x-hardgate-w8a8.metadata.json

@@ -736,7 +736,13 @@ Red channel shows low-frequency (GI) gradients, green channel shows direct diffu
 and blue channel shows direct specular gradients. Default value is 0.
 
 #### `flt_taa`
-Enables temporal anti-aliasing and primary ray direction jitter. Default value is 1.
+Selects the temporal anti-aliasing / reconstruction mode, and with it primary ray
+direction jitter. Default value is 2.
+| Value | Mode                                                        |
+| ----- | ----------------------------------------------------------- |
+| 0     | none                                                         |
+| 1     | temporal AA                                                  |
+| 2     | temporal upscaling (TAAU)                                    |
 
 #### `flt_fsr_enable`
 Enables FidelityFX Super Resolution 1.0 ("AMD FSR 1.0") upscaling. Default value is 0.
@@ -760,6 +766,163 @@ Range is from 0.0 to 2.0, with lower meaning sharper.
 #### `flt_fsr_easu`, `flt_fsr_rcas`
 Individual control of the upscaling and sharpening steps of FSR. Both default to 1.
 Intended for testing purposes.
+
+#### `flt_upscaling`
+Selects the upscaler shown in the video settings menu. The upscalers are mutually
+exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable` for you.
+Default value is 0.
+| Value | Upscaler                       |
+| ----- | ------------------------------ |
+| 0     | none                           |
+| 1     | AMD FSR 1.0                    |
+| 2     | QuickSRNet Small               |
+| 3     | QuickSRNet Large               |
+| 4     | QuickSRNet Large (Q2RTX-tuned) |
+| 5     | QuickSRNet Compact Temporal 2x |
+
+Values 2 through 4 are *spatial* models: one frame in, one frame out, with no memory
+between frames. Value 5 is *temporal* — it reconstructs from a latent state it emits
+itself and the engine reprojects back to it each frame — and behaves differently enough
+that its own section is below.
+
+A spatial QuickSRNet model's scale factor is a property of the model, not a resolution policy:
+`viewsize` and the dynamic resolution scaling cvars choose the render extent exactly as
+they do for every other path, and the model then multiplies it by its fixed factor.
+Whatever that overshoots the display by is removed on the way out by an area-weighted
+box filter.
+
+So the downsample ratio is `viewsize * scale / 100`. With a 4x model, `viewsize 25`
+lands on the display exactly (480x270 at 1080p) and no resampling happens — the cheap
+upscale-for-performance case. Above that the extra resolution is real supersampling,
+and at `viewsize 100` the path tracer renders at native resolution and the frame is
+4x-downsampled. That is high quality and far too slow for gameplay, since the tile
+count — and with it the number of serial NPU inferences — grows with the square of
+`viewsize`. See `flt_upscaler_max_tiles`.
+
+#### The temporal model (`flt_upscaling 5`)
+QuickSRNet Compact Temporal is a 2x model that does its own temporal antialiasing. Each
+frame it emits a 16-channel latent state alongside the upscaled image; the next frame
+reprojects that state onto the new pixel grid with the motion vectors and hands it back,
+so the model accumulates detail across frames the way a TAA resolve does, but learned.
+Alongside the state the engine hands over a per-pixel confidence — in-bounds and
+depth-consistent — and the network gates its whole recurrent branch on it, so a
+disoccluded pixel falls back to a purely spatial reconstruction instead of smearing.
+
+Three consequences worth knowing before turning it on.
+
+**Its resolution is pinned into the session, not chosen per frame.** The model's spatial
+dimensions are free in the ONNX graph and get fixed when its ONNX Runtime session is
+created. So `viewsize` still selects the render extent, exactly as it does for the spatial
+models — but changing it rebuilds the session and stalls for a few seconds while the QNN
+execution provider re-finalizes the graph, rather than taking effect on the next frame.
+Dynamic resolution scaling, which varies the scale every frame, cannot apply at all and
+stays inert.
+
+`viewsize` is capped at 50 for a 2x model — its 1:1 point, where the output lands on your
+display exactly. That is the effective default, since the stock `viewsize 100` clamps to
+it. Below 50 the model output lands short of the display and the remainder is a plain
+bilinear stretch by `upscaler_temporal_unpack.comp`:
+
+| `viewsize` | render extent (1080p) | model output | to display |
+| ---------- | --------------------- | ------------ | ---------- |
+| 50         | 960x540               | 1920x1080    | 1:1        |
+| 33         | 632x356               | 1264x712     | 1.5x stretch |
+| 25         | 480x270               | 960x540      | 2x stretch |
+
+So `viewsize 25` quarters the path tracing cost and the staging, at the price of a
+visibly softer image — the learned reconstruction happens at quarter resolution and is
+then blown up, with no model involved in the last step. Above 50 the model would render
+above your display resolution and throw the excess away, which for a whole-frame model
+costs several times the staging for an image the display cannot show, so it is capped
+instead of refused.
+
+Both inputs are debounced: the extent has to hold still for a quarter second before the
+session is rebuilt, so dragging the viewsize slider or a window edge costs one reload
+rather than one per step. Changes that recreate the swapchain without moving the extent —
+alt-tabbing, minimizing, toggling HDR or vsync — cost nothing.
+
+**It needs tone mapping.** The model consumes a display-referred `[0,1]` frame taken
+*before* Q2RTX's own TAA, which is produced as a second pass over the tone-mapping curve.
+With `tm_enable 0` no such frame exists, so the model sits the frame out and the ordinary
+blit takes over.
+
+**It costs memory, not tiles.** One inference covers the whole frame, so
+`flt_upscaler_max_tiles` says nothing about it. What does bite is staging: a 16-channel
+float32 state is several times the size of the frame itself, and because the extent
+follows the display, so does the cost. At `viewsize 50` the two frames in flight want
+roughly 200 MB between them at 1080p, 350 MB at 1440p and 800 MB at 2160p — so at 4K the
+default `flt_upscaler_max_bytes 512` refuses the model and the ordinary blit takes over.
+Lowering `viewsize` is the other way out: it scales the staging with the square of the
+render extent, so `viewsize 25` brings 4K down to about 200 MB.
+
+Q2RTX's own TAA still runs — the jitter the model relies on comes from it — but its
+output no longer feeds the model, only the fallback blit.
+
+#### `flt_upscaler_enable`
+Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall,
+2 is QuickSRNetLarge, 3 is a QuickSRNetLarge fine-tuned on Quake II RTX frames (which
+trades generality for sharper results on this game's content at the same cost as the
+stock Large model), and 4 is the compact temporal model described above. Default value is
+0. Normally driven by `flt_upscaling` rather than set directly.
+
+Spatial models must be square fixed-shape 3-channel uint8 NCHW with an integer scale
+factor. Temporal models must present three float32 inputs (`current_frame`,
+`trusted_warped_state`, `temporal_confidence`) and two outputs (`upscaled_frame`,
+`current_state`) that agree on one low-res extent, with the state round-tripping at the
+same channel count, and must declare their spatial dimensions as the free dims `lr_width`
+and `lr_height` so the engine can pin them to the display. Anything else is rejected at
+load time rather than rendered as garbage.
+
+`temporal_confidence` is the product of the engine's history-rejection terms, which for
+Q2RTX is a binary in-bounds AND depth-consistent AND same-facing mask (see
+`flt_upscaler_reproj_threshold`). The graph uses it twice — as a feature, and as a hard
+gate multiplying the fusion output, which is what every path from
+`trusted_warped_state` to the result passes through. So the network rejects stale history
+itself. `upscaler_temporal_pack.comp` zeroes the warped state at rejected pixels anyway:
+that is the warp the model trained against, and it lets the shader skip sixteen bilinear
+fetches on a pixel whose history is about to be gated away regardless.
+
+Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon). The
+models themselves ship in `baseq2/models`. If a model file is missing or the QNN
+execution provider is unavailable, the upscaler stays off and says so on the console;
+`scripts/deploy-assets.ps1 -VerifyOnly` reports which models are actually present.
+
+Changing this reloads the ONNX Runtime session, which stalls for a few seconds while
+the QNN execution provider finalizes the model for the NPU.
+
+#### `flt_upscaler_verbose`
+Raises ONNX Runtime logging to verbose, which is where the per-node execution-provider
+assignment is reported — the authoritative way to confirm inference really dispatches
+to the NPU rather than falling back to the CPU. Far too chatty for normal play.
+Default value is 0.
+
+#### `flt_upscaler_max_bytes`
+The temporal model's budget for host-visible staging, in megabytes, counting both frames
+in flight. A model asking for more is refused and the frame falls back to the ordinary
+blit, rather than stalling on a huge mapped allocation. Default value is 512, which at
+`viewsize 50` admits 1080p (about 200 MB) and 1440p (about 350 MB) but not 2160p (about
+800 MB), since the model's extent — and therefore its staging — follows the display and
+`viewsize`. Lowering `viewsize` is usually the better answer than raising this. The
+spatial models are bounded by `flt_upscaler_max_tiles` instead; this does not apply to
+them.
+
+#### `flt_upscaler_reproj_threshold`
+How far the reprojected view depth may disagree with what the motion vector predicts,
+relative, before the temporal model's history for that pixel is dropped as disoccluded.
+Too high leaves ghost patches trailing behind moving geometry; too low throws away good
+history and lets the image sizzle. Default value is 0.05, the same order as the
+reprojection tests in the ASVGF passes.
+
+Depth is only half the test. The history is also rejected wherever the geometric normal
+has turned away (`dot < 0.5`), which is what catches a surface that reprojects to a
+plausible depth while facing a different direction — the common case when the camera
+rotates along a wall or turns a corner, and the one depth alone cannot see. That half is
+not tunable, matching `asvgf_temporal.comp`. Both halves are evaluated at each of the
+four bilinear taps the state warp reads, so a tap on the far side of a silhouette is
+dropped and the survivors are renormalized, rather than one probe deciding for all four.
+
+Setting this to 0 rejects every pixel, which collapses the model onto its purely spatial
+path — a useful way to tell whether an artifact comes from the temporal branch at all.
 
 #### `gr_enable`
 Enables the god rays (volumetric lighting) effect. Default value is 1.

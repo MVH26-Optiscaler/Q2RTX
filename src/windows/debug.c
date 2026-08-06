@@ -396,7 +396,9 @@ static LONG WINAPI exception_filter(LPEXCEPTION_POINTERS exceptionInfo)
     exception = exceptionInfo->ExceptionRecord;
     context = exceptionInfo->ContextRecord;
 
-#ifdef _WIN64
+#if defined(_M_ARM64)
+    pc = context->Pc;
+#elif defined(_WIN64)
     pc = context->Rip;
 #else
     pc = (DWORD64)context->Eip;
@@ -418,7 +420,25 @@ static LONG WINAPI exception_filter(LPEXCEPTION_POINTERS exceptionInfo)
     write_report("Address: %"PRIxx" (%s)\r\n", WORDxx(pc), faultyModuleName);
 
     write_report("\r\nThread context:\r\n");
-#ifdef _WIN64
+#if defined(_M_ARM64)
+    write_report("PC : %"PRIxx64" FP : %"PRIxx64" SP : %"PRIxx64" LR : %"PRIxx64"\r\n",
+                 context->Pc, context->Fp, context->Sp, context->Lr);
+    write_report("X0 : %"PRIxx64" X1 : %"PRIxx64" X2 : %"PRIxx64" X3 : %"PRIxx64"\r\n",
+                 context->X0, context->X1, context->X2, context->X3);
+    write_report("X4 : %"PRIxx64" X5 : %"PRIxx64" X6 : %"PRIxx64" X7 : %"PRIxx64"\r\n",
+                 context->X4, context->X5, context->X6, context->X7);
+    write_report("X8 : %"PRIxx64" X9 : %"PRIxx64" X10: %"PRIxx64" X11: %"PRIxx64"\r\n",
+                 context->X8, context->X9, context->X10, context->X11);
+    write_report("X12: %"PRIxx64" X13: %"PRIxx64" X14: %"PRIxx64" X15: %"PRIxx64"\r\n",
+                 context->X12, context->X13, context->X14, context->X15);
+    write_report("X16: %"PRIxx64" X17: %"PRIxx64" X18: %"PRIxx64" X19: %"PRIxx64"\r\n",
+                 context->X16, context->X17, context->X18, context->X19);
+    write_report("X20: %"PRIxx64" X21: %"PRIxx64" X22: %"PRIxx64" X23: %"PRIxx64"\r\n",
+                 context->X20, context->X21, context->X22, context->X23);
+    write_report("X24: %"PRIxx64" X25: %"PRIxx64" X26: %"PRIxx64" X27: %"PRIxx64"\r\n",
+                 context->X24, context->X25, context->X26, context->X27);
+    write_report("X28: %"PRIxx64"\r\n", context->X28);
+#elif defined(_WIN64)
     write_report("RIP: %"PRIxx64" RBP: %"PRIxx64" RSP: %"PRIxx64"\r\n",
                  context->Rip, context->Rbp, context->Rsp);
     write_report("RAX: %"PRIxx64" RBX: %"PRIxx64" RCX: %"PRIxx64"\r\n",
@@ -441,7 +461,11 @@ static LONG WINAPI exception_filter(LPEXCEPTION_POINTERS exceptionInfo)
 #endif
 
     ZeroMemory(&stackFrame, sizeof(stackFrame));
-#ifdef _WIN64
+#if defined(_M_ARM64)
+    stackFrame.AddrPC.Offset = context->Pc;
+    stackFrame.AddrFrame.Offset = context->Fp;
+    stackFrame.AddrStack.Offset = context->Sp;
+#elif defined(_WIN64)
     stackFrame.AddrPC.Offset = context->Rip;
     stackFrame.AddrFrame.Offset = context->Rbp;
     stackFrame.AddrStack.Offset = context->Rsp;
@@ -460,7 +484,9 @@ static LONG WINAPI exception_filter(LPEXCEPTION_POINTERS exceptionInfo)
     symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
     symbol->MaxNameLen = 256;
     while (pStackWalk64(
-#ifdef _WIN64
+#if defined(_M_ARM64)
+               IMAGE_FILE_MACHINE_ARM64,
+#elif defined(_WIN64)
                IMAGE_FILE_MACHINE_AMD64,
 #else
                IMAGE_FILE_MACHINE_I386,
