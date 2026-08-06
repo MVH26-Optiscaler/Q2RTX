@@ -56,6 +56,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "vkpt.h"
 
 extern cvar_t *cvar_profiler_scale;
+extern cvar_t *cvar_bloom_enable; // owned by bloom.c; the pre-TAA tap has to know whether bloom ran
 
 // Here are each of the pipelines we'll be using, followed by an additional
 // enum value to count the number of tone mapping pipelines.
@@ -64,6 +65,11 @@ enum {
 	TONE_MAPPING_CURVE,
 	TONE_MAPPING_APPLY_SDR,
 	TONE_MAPPING_APPLY_HDR,
+	// Same shader, same curve, but reading FLAT_COLOR and writing
+	// UPSCALE_INPUT: the pre-TAA tone-mapped frame the temporal NPU upscaler
+	// wants as its model input. Runs in addition to APPLY_SDR/HDR, never
+	// instead of one. Always SDR -- the model's output is [0,1].
+	TONE_MAPPING_APPLY_PRE_TAA_TAP,
 	TM_NUM_PIPELINES
 };
 
@@ -92,7 +98,7 @@ vkpt_tone_mapping_initialize()
 	VkPushConstantRange push_constant_range_apply = {
 		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
 		.offset = 0,
-		.size = 3*sizeof(float)
+		.size = 4*sizeof(float)
 	};
 
 	CREATE_PIPELINE_LAYOUT(qvk.device, &pipeline_layout_tone_mapping_histogram,
@@ -151,14 +157,28 @@ vkpt_tone_mapping_create_pipelines()
 		{ .constantID = 0, .offset = 0, .size = sizeof(uint32_t) }
 	};
 
+	// { "HDR tone mapping", "pre-TAA tap" } flags, laid out as two consecutive
+	// uint32s so the tap variant can select both constants from one array.
+	VkSpecializationMapEntry specEntriesTap[] = {
+		{ .constantID = 0, .offset = 0,                .size = sizeof(uint32_t) },
+		{ .constantID = 1, .offset = sizeof(uint32_t), .size = sizeof(uint32_t) }
+	};
+
 	// "HDR tone mapping" flag
 	uint32_t spec_data[] = {
 		0,
 		1,
 	};
 
+	// { spec_tone_mapping_hdr = 0, spec_pre_taa_tap = 1 }
+	uint32_t spec_data_tap[] = {
+		0,
+		1,
+	};
+
 	VkSpecializationInfo specInfo_SDR = {.mapEntryCount = 1, .pMapEntries = specEntries, .dataSize = sizeof(uint32_t), .pData = &spec_data[0]};
 	VkSpecializationInfo specInfo_HDR = {.mapEntryCount = 1, .pMapEntries = specEntries, .dataSize = sizeof(uint32_t), .pData = &spec_data[1]};
+	VkSpecializationInfo specInfo_TAP = {.mapEntryCount = 2, .pMapEntries = specEntriesTap, .dataSize = sizeof(spec_data_tap), .pData = spec_data_tap};
 
 	VkComputePipelineCreateInfo pipeline_info[TM_NUM_PIPELINES] = {
 		[TONE_MAPPING_HISTOGRAM] = {
@@ -179,6 +199,11 @@ vkpt_tone_mapping_create_pipelines()
 		[TONE_MAPPING_APPLY_HDR] = {
 			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
 			.stage = SHADER_STAGE_SPEC(QVK_MOD_TONE_MAPPING_APPLY_COMP, VK_SHADER_STAGE_COMPUTE_BIT, &specInfo_HDR),
+			.layout = pipeline_layout_tone_mapping_apply,
+		},
+		[TONE_MAPPING_APPLY_PRE_TAA_TAP] = {
+			.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+			.stage = SHADER_STAGE_SPEC(QVK_MOD_TONE_MAPPING_APPLY_COMP, VK_SHADER_STAGE_COMPUTE_BIT, &specInfo_TAP),
 			.layout = pipeline_layout_tone_mapping_apply,
 		},
 	};
@@ -391,10 +416,16 @@ vkpt_tone_mapping_record_cmd_buffer(VkCommandBuffer cmd_buf, float frame_time)
 	float knee_a = -knee_start * knee_start;
 	float knee_b = knee_w - 2.0*knee_start;
 
-	float push_constants_tm2_apply[3] = {
+	// Mirrors the condition main.c records the bloom passes under. When bloom
+	// did not run, TEX_BLOOM_VBLUR holds nothing this frame put there, so the
+	// tap must not blend it in.
+	bool bloom_ran = cvar_bloom_enable->integer != 0 || qvk.frame_menu_mode;
+
+	float push_constants_tm2_apply[4] = {
 		knee_w, // knee_w in piecewise knee adjustment
 		knee_a, // knee_a in piecewise knee adjustment
 		knee_b, // knee_b in piecewise knee adjustment
+		bloom_ran ? 1.0f : 0.0f, // tap_bloom, only read by the pre-TAA tap
 	};
 
 	vkCmdPushConstants(cmd_buf, pipeline_layout_tone_mapping_apply,
@@ -409,6 +440,23 @@ vkpt_tone_mapping_record_cmd_buffer(VkCommandBuffer cmd_buf, float frame_time)
 	// to be written before continuing. This could be ensured in several
 	// other ways as well.
 	BARRIER_COMPUTE(cmd_buf, qvk.images[VKPT_IMG_TAA_OUTPUT]);
+
+	// Second pass over the pre-TAA frame for the temporal NPU upscaler, which
+	// needs the same curve applied to FLAT_COLOR rather than to the TAA result.
+	// Shares the layout and push constants above, so only the pipeline and the
+	// extent differ. Recorded here rather than in upscaler.c so the curve stays
+	// in one place; vkpt_upscaler_do() runs later in the same command buffer.
+	if (vkpt_upscaler_wants_input_tap())
+	{
+		vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[TONE_MAPPING_APPLY_PRE_TAA_TAP]);
+
+		vkCmdDispatch(cmd_buf,
+			(qvk.extent_render.width + 15) / 16,
+			(qvk.extent_render.height + 15) / 16,
+			1);
+
+		BARRIER_COMPUTE(cmd_buf, qvk.images[VKPT_IMG_UPSCALE_INPUT]);
+	}
 
 	reset_required = 0;
 

@@ -250,6 +250,16 @@ static bool upscaler_active_this_frame(void)
 
 static VkExtent2D get_render_extent(void)
 {
+	// A temporal NPU model has its extent pinned into its ONNX Runtime session,
+	// so unlike every other path here it cannot be rescaled per frame. viewsize
+	// still chooses it -- vkpt_upscaler_check_render_extent() rebuilds the
+	// session when it moves -- but by the time we get here that choice is already
+	// baked, so the model's extent is the render extent, full stop. DRS, which
+	// varies the scale every frame, has nothing to choose at all.
+	VkExtent2D temporal_extent;
+	if (vkpt_upscaler_get_temporal_extent(&temporal_extent))
+		return temporal_extent;
+
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -276,6 +286,22 @@ static VkExtent2D get_render_extent(void)
 
 static VkExtent2D get_screen_image_extent(void)
 {
+	// The temporal model writes IMG_UPSCALE_OUTPUT at its own output extent,
+	// which the display does not have to match in either direction -- below
+	// viewsize 50 a 2x model lands short of it and the unpack magnifies -- so the
+	// screen images have to cover both. Handled ahead of the DRS branch because
+	// DRS is inert while a temporal model is loaded anyway.
+	VkExtent2D temporal_extent;
+	if (vkpt_upscaler_get_temporal_extent(&temporal_extent))
+	{
+		uint32_t scale = vkpt_upscaler_get_scale();
+		VkExtent2D result;
+		result.width  = max(temporal_extent.width * scale, qvk.extent_unscaled.width);
+		result.height = max(temporal_extent.height * scale, qvk.extent_unscaled.height);
+		result.width  = (result.width + 1) & ~1;
+		return result;
+	}
+
 	VkExtent2D result;
 	if (cvar_drs_enable->integer)
 	{
@@ -3562,6 +3588,12 @@ R_BeginFrame_RTX(void)
 			recreate_swapchain();
 		}
 	}
+
+	// qvk.extent_unscaled has settled for this frame, and a temporal NPU model's
+	// shape was pinned when its session was built. Reconcile the two before
+	// get_render_extent() asks the model how big to render, so a resolution or
+	// viewsize change costs one reload rather than a frame at the wrong extent.
+	vkpt_upscaler_check_render_extent();
 
 	drs_process();
 

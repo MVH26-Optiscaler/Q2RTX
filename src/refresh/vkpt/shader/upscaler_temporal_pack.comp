@@ -1,0 +1,303 @@
+/*
+Copyright (C) 2026, Q2RTX contributors.
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+// ========================================================================== //
+// NPU upscaler, temporal pack pass.
+//
+// Builds the three float32 NCHW input tensors of the compact temporal
+// QuickSRNet model, all at the low-res extent its session was pinned to:
+//
+//   current_frame        [1,3,H,W]  tone-mapped, jittered colour
+//   trusted_warped_state [1,C,H,W]  last frame's latent state, reprojected here
+//   temporal_confidence  [1,1,H,W]  0 or 1, bounds * depth * normal
+//
+// laid out back to back in one buffer, in that order, so upscaler.c can point
+// three OrtValues at fixed offsets of a single mapped allocation.
+//
+// Unlike the spatial models this is not a tiled 1:1 copy. The model reconstructs
+// temporally from its own state, and that state has to be warped from the
+// previous frame's pixel grid to this one before the network sees it -- which is
+// this pass's real job. The warp has to match what the model trained against:
+// backward motion, bilinear, zeros outside.
+//
+// The state comes straight out of the *previous* slot's output buffer (set 2,
+// binding 2), which ONNX Runtime wrote from the CPU at the top of this frame.
+// It never becomes a Vulkan image: nothing else reads it, and round-tripping it
+// through one would cost a pass and an allocation to gain nothing.
+//
+// See upscaler.c.
+// ========================================================================== //
+
+#version 450
+#extension GL_GOOGLE_include_directive    : enable
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "utils.glsl"
+
+#define GLOBAL_UBO_DESC_SET_IDX 0
+#include "global_ubo.h"
+
+#define GLOBAL_TEXTURES_DESC_SET_IDX 1
+#include "global_textures.h"
+
+layout(set = 2, binding = 0, std430) writeonly buffer InputTensorBuffer {
+	float input_tensor[];
+};
+
+// The previous slot's output buffer: [ upscaled_frame | current_state ]. Only
+// the state part is read here.
+layout(set = 2, binding = 2, std430) readonly buffer PrevOutputTensorBuffer {
+	float prev_output_tensor[];
+};
+
+layout(push_constant) uniform PushConstants {
+	uint lr_width;
+	uint lr_height;
+	uint out_width;
+	uint out_height;
+	uint state_channels;
+	// 0 when there is no state worth warping: the first frame after the model
+	// loads, after a discard, after the extent changed, or when the previous
+	// inference did not complete. Zero is the network's own "no history" input,
+	// so this just forces the state and the confidence to zero.
+	uint has_history;
+	float reproj_threshold;
+} push;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Flat-screen position -> checkerboarded G-buffer position.
+//
+// The PT_* G-buffer images are full width but hold two half-width checkerboard
+// fields side by side, so reading one at a flat position lands on the wrong
+// pixel and produces a doubled, half-width-offset image. The FLAT_* images are
+// the de-checkerboarded copies (checkerboard_interleave.comp) and need no
+// conversion, but there is no flat view depth, so depth reads have to convert.
+//
+// Same mapping as checkerboard_interleave.comp's get_input_position(), minus
+// global_ubo.pt_swap_checkerboard: that only alternates in reference/noisy mode,
+// and the upscaler requires the denoiser, so on this path it is always 0. This
+// matches asvgf_temporal.comp's flat_to_checker(), which omits it for the same
+// reason -- and it matters, because a per-frame parity flip would mean the
+// previous frame's depth needed the opposite mapping.
+ivec2 flat_to_checker(ivec2 pos)
+{
+	bool is_even_checkerboard = (pos.x & 1) == (pos.y & 1);
+
+	return ivec2(
+		(pos.x / 2) + (is_even_checkerboard ? 0 : int(push.lr_width) / 2),
+		pos.y);
+}
+
+// One channel of the previous state at an integer low-res pixel, or 0 outside --
+// which is the zero padding F.grid_sample(padding_mode="zeros") applied during
+// training, and also what the network reads as "nothing here".
+float fetch_state(ivec2 pos, uint channel, uint plane_stride, uint state_base)
+{
+	if (any(lessThan(pos, ivec2(0))) || any(greaterThanEqual(pos, ivec2(push.lr_width, push.lr_height))))
+		return 0.0;
+
+	return prev_output_tensor[state_base + channel * plane_stride + uint(pos.y) * push.lr_width + uint(pos.x)];
+}
+
+// Whether the previous frame's pixel `pos` is the same surface as the one being
+// reconstructed here -- depth AND geometric normal, which is the whole of the
+// test asvgf_temporal.comp applies at its line 225, not just the depth half.
+//
+// The normal term is what depth alone cannot catch. Under camera rotation a wall,
+// a floor or the far side of a corner reprojects to a perfectly plausible depth
+// while facing a different way, so the depth test passes and stale history is
+// accepted across a surface it never belonged to. That is the ghosting.
+//
+// Applied per bilinear tap rather than once per pixel: the warp below reads four
+// texels, and a silhouette can put three of them on the far surface while the
+// nearest one -- the only one the old single probe tested -- sits on the near one.
+bool tap_is_same_surface(ivec2 pos, float depth_curr, vec3 geo_normal_curr,
+	float motion_z, bool secondary_surface)
+{
+	if (any(lessThan(pos, ivec2(0))) || any(greaterThanEqual(pos, ivec2(push.lr_width, push.lr_height))))
+		return false;
+
+	ivec2 cpos = flat_to_checker(pos);
+
+	float depth_prev = texelFetch(TEX_PT_VIEW_DEPTH_B, cpos, 0).x;
+	vec3 geo_normal_prev = decode_normal(texelFetch(TEX_PT_GEO_NORMAL_B, cpos, 0).x);
+
+	// Relative, and against the depth the motion vector itself predicts, so that a
+	// surface moving toward or away from the camera is not mistaken for a
+	// disocclusion. Both view-depth images hold linear view-space distance, so
+	// there is no projection to undo.
+	float dist_depth = abs(depth_curr - depth_prev + motion_z) / max(abs(depth_curr), 1e-3);
+
+	// The sign carries information: reflect_refract.rgen negates the view depth to
+	// mark a pixel whose primary surface is a reflection or refraction. Those have
+	// notoriously inaccurate motion vectors, so the magnitude is what the test
+	// compares and the tolerance is widened for them, exactly as
+	// asvgf_temporal.comp does. Testing the signed value instead would fail on
+	// every mirror, every pane of glass and every polished floor -- which in this
+	// game is most of the frame. It is also why the normal term matters so much
+	// here: on those surfaces the depth term is deliberately four times weaker.
+	if (secondary_surface)
+		dist_depth *= 0.25;
+
+	return dist_depth < push.reproj_threshold
+		&& dot(geo_normal_curr, geo_normal_prev) > 0.5;
+}
+
+void main()
+{
+	ivec2 ipos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 lr_size = ivec2(push.lr_width, push.lr_height);
+
+	if (any(greaterThanEqual(ipos, lr_size)))
+		return;
+
+	uint plane_stride = push.lr_width * push.lr_height;
+	uint pixel = uint(ipos.y) * push.lr_width + uint(ipos.x);
+
+	// Input tensor plane layout, in the order upscaler.c binds the OrtValues.
+	uint plane_state      = 3u;
+	uint plane_confidence = 3u + push.state_channels;
+
+	// ---------------------------------------------------------------- colour
+	//
+	// IMG_UPSCALE_INPUT is the pre-TAA tone-mapped frame written by the tap
+	// variant of tone_mapping_apply.comp: display-referred, jittered, and not
+	// yet temporally filtered, which is the distribution the model trained on.
+	// Values above ~0.992 saturate in the model's own input Quantize node; that
+	// is the model's encoding, so nothing is done about it here beyond keeping
+	// the value in range.
+	vec3 color = clamp(texelFetch(TEX_UPSCALE_INPUT, ipos, 0).rgb, vec3(0), vec3(1));
+
+	input_tensor[0u * plane_stride + pixel] = color.r;
+	input_tensor[1u * plane_stride + pixel] = color.g;
+	input_tensor[2u * plane_stride + pixel] = color.b;
+
+	// ------------------------------------------------------------ reprojection
+	//
+	// FLAT_MOTION is the de-checkerboarded copy of PT_MOTION. .xy is a UV-space
+	// delta with the convention prev_uv = uv + motion (primary_rays.rgen), which
+	// is the same backward direction the model was trained with, and being in UV
+	// it needs no rescaling when the render extent changes. .z is
+	// distance_prev - distance_curr, which gives the disocclusion test its
+	// expected depth for free.
+	vec4 motion = texelFetch(TEX_FLAT_MOTION, ipos, 0);
+
+	vec2 uv = (vec2(ipos) + vec2(0.5)) / vec2(lr_size);
+	vec2 prev_uv = uv + motion.xy;
+
+	bool onscreen = all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThan(prev_uv, vec2(1.0)));
+
+	// ------------------------------------------------------------ confidence
+	//
+	// The product of the rejection terms the engine owns: in-bounds AND
+	// depth-consistent AND same-facing, all binary, so the mask handed over is 0
+	// or 1. That is the whole of the test asvgf_temporal.comp applies, evaluated
+	// per bilinear tap the way that pass evaluates it -- see tap_is_same_surface()
+	// for why both halves are needed. The model's own training-time criterion was
+	// expressed in device depth Q2RTX does not keep, so this stands in for it.
+	ivec2 cpos = flat_to_checker(ipos);
+
+	float depth_curr = texelFetch(TEX_PT_VIEW_DEPTH_A, cpos, 0).x;
+	vec3 geo_normal_curr = decode_normal(texelFetch(TEX_PT_GEO_NORMAL_A, cpos, 0).x);
+
+	bool secondary_surface = depth_curr < 0.0;
+
+	float confidence = 0.0;
+
+	// Bilinear tap centres. grid_sample(align_corners=False) puts the sample for
+	// index i at i + mv, which is what subtracting the half-texel from the
+	// denormalized UV gives.
+	vec2 prev_px = prev_uv * vec2(lr_size) - vec2(0.5);
+
+	ivec2 p0 = ivec2(floor(prev_px));
+	vec2  f  = prev_px - vec2(p0);
+
+	const ivec2 tap_offset[4] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+
+	float tap_weight[4] = float[4](
+		(1.0 - f.x) * (1.0 - f.y),
+		(      f.x) * (1.0 - f.y),
+		(1.0 - f.x) * (      f.y),
+		(      f.x) * (      f.y));
+
+	// Zero the weight of every tap that landed on a different surface, and keep
+	// what survives. Renormalizing the remainder rather than letting the total
+	// fall short is what asvgf_temporal.comp does, and it is the right call: a
+	// pixel with one good tap out of four still has real history, it just all
+	// sits in that one texel.
+	float sum_w = 0.0;
+
+	if (push.has_history != 0u && onscreen)
+	{
+		for (int i = 0; i < 4; i++)
+		{
+			if (tap_is_same_surface(p0 + tap_offset[i], depth_curr, geo_normal_curr,
+					motion.z, secondary_surface))
+				sum_w += tap_weight[i];
+			else
+				tap_weight[i] = 0.0;
+		}
+	}
+
+	if (sum_w > 1e-6)
+		confidence = 1.0;
+
+	input_tensor[plane_confidence * plane_stride + pixel] = confidence;
+
+	// ---------------------------------------------------------- warped state
+	//
+	// The masking below is no longer what keeps stale history out. The state does
+	// enter a plain Conv unmasked, but everything downstream of it -- the sum with
+	// the colour and confidence branches, the fusion trunk, and fusion_output --
+	// funnels through a Mul by temporal_confidence before the residual add, so at
+	// confidence 0 the network falls back to its purely spatial path by itself.
+	// (The model this replaced had no such gate, which is why the comment that
+	// used to be here called the masking load-bearing.)
+	//
+	// It is kept for two reasons: it is the "warped state x confidence" step the
+	// model trained against, and skipping the warp on a rejected pixel saves four
+	// fetches per state channel -- sixty-four of them at C = 16.
+	//
+	// The weights come from the per-tap surface test above, so unlike the plain
+	// mix() this used to do, a tap sitting on the far side of a silhouette
+	// contributes nothing instead of bleeding that surface's history across the
+	// edge. inv_sum_w puts the survivors back on a partition of unity.
+	uint state_base = 3u * push.out_width * push.out_height;
+
+	float inv_sum_w = (sum_w > 1e-6) ? (1.0 / sum_w) : 0.0;
+
+	for (uint c = 0u; c < push.state_channels; c++)
+	{
+		float s = 0.0;
+
+		if (confidence > 0.0)
+		{
+			for (int i = 0; i < 4; i++)
+			{
+				if (tap_weight[i] > 0.0)
+					s += fetch_state(p0 + tap_offset[i], c, plane_stride, state_base) * tap_weight[i];
+			}
+
+			s *= inv_sum_w;
+		}
+
+		input_tensor[(plane_state + c) * plane_stride + pixel] = s;
+	}
+}

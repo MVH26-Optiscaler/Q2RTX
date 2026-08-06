@@ -102,6 +102,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP32_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_UPSCALER_PACK_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_UPSCALER_UNPACK_COMP)                   \
+	SHADER_MODULE_DO(QVK_MOD_UPSCALER_TEMPORAL_PACK_COMP)            \
+	SHADER_MODULE_DO(QVK_MOD_UPSCALER_TEMPORAL_UNPACK_COMP)          \
 	SHADER_MODULE_DO(QVK_MOD_NORMALIZE_NORMAL_MAP_COMP)              \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_FRAG)                        \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_VERT)                        \
@@ -499,6 +501,8 @@ void create_orthographic_matrix(mat4_t matrix, float xmin, float xmax,
 	PROFILER_DO(UPSCALER,                   1) \
 	PROFILER_DO(UPSCALER_PACK,              2) \
 	PROFILER_DO(UPSCALER_UNPACK,            2) \
+	PROFILER_DO(UPSCALER_TEMPORAL_PACK,     2) \
+	PROFILER_DO(UPSCALER_TEMPORAL_UNPACK,   2) \
 	PROFILER_DO(UPDATE_ENVIRONMENT,         1) \
 	PROFILER_DO(GOD_RAYS,                   1) \
 	PROFILER_DO(GOD_RAYS_REFLECT_REFRACT,   1) \
@@ -720,9 +724,26 @@ VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
 // dispatch must signal, or VK_NULL_HANDLE when it carries none. It is what next
 // frame's inference waits on instead of draining the queue.
 VkFence vkpt_upscaler_pack_fence(void);
-// Drops any tensor the spatial upscaler has in flight. Must be called on frames
+// Drops any tensor the upscaler has in flight. Must be called on frames
 // that skip vkpt_upscaler_final_blit(), which is what would otherwise consume it.
 void vkpt_upscaler_discard(void);
+// True when the loaded model is a temporal one, which needs the pre-TAA
+// tone-mapped frame in VKPT_IMG_UPSCALE_INPUT rather than the TAA output.
+// Queried by vkpt_tone_mapping_record_cmd_buffer(), which records that pass.
+bool vkpt_upscaler_wants_input_tap(void);
+// The low-resolution extent a loaded temporal model demands, or false when no
+// temporal model is loaded. Unlike the spatial models, which scale whatever they
+// are given, a temporal model runs at one extent decided when its session was
+// created, so it pins the render extent -- see get_render_extent() in main.c.
+bool vkpt_upscaler_get_temporal_extent(VkExtent2D *extent);
+// Rebuilds a temporal model's session when the extent it was pinned to is no
+// longer what the display and viewsize ask for, and does nothing otherwise. Must
+// be called once the swapchain has settled for the frame and before
+// get_render_extent(), since it moves what that returns. Stalls for seconds when
+// it does fire -- the QNN EP re-finalizes the graph -- so it reacts to the wanted
+// extent rather than to the swapchain being recreated, and waits for that extent
+// to hold still before acting on it.
+void vkpt_upscaler_check_render_extent(void);
 
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);

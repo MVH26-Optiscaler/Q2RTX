@@ -59,8 +59,9 @@
     that script fetches the TFLite variants because it targets USE_LITE_RT, while
     upscaler.c on this branch loads ONNX.
 
-    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) is skipped: it has no upstream
-    zip to fetch (it is fine-tuned locally), so the repo is its only source.
+    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) and the compact temporal model
+    (flt_upscaling 5) are skipped: neither has an upstream zip to fetch, so the repo is
+    their only source.
 
     Note the rename asymmetry, which is what makes this fiddly to do by hand: each zip
     ships e.g. quicksrnetsmall.onnx + quicksrnetsmall.data, and the model must be
@@ -143,6 +144,12 @@ $UpscalerModels = @(
         Id       = "quicksrnetlarge-q2rtx"
         Onnx     = "quicksrnetlarge-q2rtx-w8a8.onnx"
         Selector = "flt_upscaling 4"
+        Bundled  = $true
+    },
+    @{
+        Id       = "compact-temporal-2x-hardgate"
+        Onnx     = "compact-temporal-2x-hardgate-w8a8.onnx"
+        Selector = "flt_upscaling 5"
         Bundled  = $true
     }
 )

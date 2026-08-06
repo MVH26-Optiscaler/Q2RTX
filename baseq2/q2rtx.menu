@@ -91,7 +91,7 @@ begin resolution
 	range -f "%.0f%%" --status "only effective in dynamic mode" "minimum scale" drs_minscale 25 100 5
 	range -f "%.0f%%" --status "only effective in dynamic mode" "maximum scale" drs_maxscale 50 150 5
 	blank
-    range -f "%.0f%%" --status "with a QuickSRNet AI upscaler, 25% is fastest and 100% supersamples" "fixed resolution scale" viewsize 25 200 5
+    range -f "%.0f%%" --status "with a spatial QuickSRNet upscaler, 25% is fastest and 100% supersamples; the temporal one caps at 50% and reloads the model when you change this" "fixed resolution scale" viewsize 25 200 5
 end
 
 begin hdr
@@ -144,7 +144,7 @@ begin video
         range -p -f "%.0f%%" "contrast" tm_reinhard 0 1 0.1
 		range "texture LOD bias" pt_texture_lod_bias -2 2 0.5
         pairs "anti-aliasing" flt_taa "none" 0 "temporal AA" 1 "temporal upscaling" 2
-        pairs "upscaling" flt_upscaling "none" 0 "AMD FSR 1.0" 1 "QuickSRNet Small" 2 "QuickSRNet Large" 3 "QuickSRNet Large (Q2RTX-tuned)" 4
+        pairs "upscaling" flt_upscaling "none" 0 "AMD FSR 1.0" 1 "QuickSRNet Small" 2 "QuickSRNet Large" 3 "QuickSRNet Large (Q2RTX-tuned)" 4 "QuickSRNet Compact Temporal 2x" 5
         range --status "lower is sharper" "AMD FSR 1.0 sharpness" flt_fsr_sharpness 0 2 0.01
         pairs "global illumination" pt_num_bounce_rays low 0.5 medium 1 high 2
         pairs "reflection/refraction depth" pt_reflect_refract off 0 1 1 2 2 4 4 8 8
