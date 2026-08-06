@@ -71,7 +71,7 @@ uint32_t get_memory_type(uint32_t mem_req_type_bits, VkMemoryPropertyFlags mem_p
 #define IMAGE_BARRIER(cmd_buf, ...) \
 	IMAGE_BARRIER_STAGES((cmd_buf), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, __VA_ARGS__)
 
-#define BUFFER_BARRIER(cmd_buf, ...) \
+#define BUFFER_BARRIER_STAGES(cmd_buf, src_stage, dst_stage, ...) \
 	do { \
 		VkBufferMemoryBarrier buf_mem_barrier = { \
 			.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, \
@@ -79,10 +79,16 @@ uint32_t get_memory_type(uint32_t mem_req_type_bits, VkMemoryPropertyFlags mem_p
 			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, \
 			__VA_ARGS__ \
 		}; \
-		vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, \
-				VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 1, &buf_mem_barrier, \
+		vkCmdPipelineBarrier(cmd_buf, (src_stage), \
+				(dst_stage), 0, 0, NULL, 1, &buf_mem_barrier, \
 				0, NULL); \
 	} while(0)
+
+// Note VK_PIPELINE_STAGE_ALL_COMMANDS_BIT does NOT include VK_PIPELINE_STAGE_HOST_BIT,
+// so any barrier using VK_ACCESS_HOST_READ_BIT/VK_ACCESS_HOST_WRITE_BIT must name
+// the host stage explicitly through the _STAGES form.
+#define BUFFER_BARRIER(cmd_buf, ...) \
+	BUFFER_BARRIER_STAGES((cmd_buf), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, __VA_ARGS__)
 
 
 #define CREATE_PIPELINE_LAYOUT(dev, layout, ...) \

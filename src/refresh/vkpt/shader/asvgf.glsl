@@ -143,13 +143,14 @@ SPEC channel:
 #define STRATUM_OFFSET_SHIFT 3
 #define STRATUM_OFFSET_MASK ((1 << STRATUM_OFFSET_SHIFT) - 1)
 
-const float gaussian_kernel[2][2] = {
+// Every entry is an exact power of two, so these are bit-identical in fp16.
+const MP float gaussian_kernel[2][2] = {
 	{ 1.0 / 4.0, 1.0 / 8.0  },
 	{ 1.0 / 8.0, 1.0 / 16.0 }
 };
 
-const float wavelet_factor = 0.5;
-const float wavelet_kernel[2][2] = {
+const MP float wavelet_factor = 0.5;
+const MP float wavelet_kernel[2][2] = {
 	{ 1.0, wavelet_factor  },
 	{ wavelet_factor, wavelet_factor * wavelet_factor }
 };

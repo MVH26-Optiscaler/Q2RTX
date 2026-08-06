@@ -109,14 +109,17 @@ vec4 show_bar_chart(ivec2 pos, bool is_curve)
 
 // Applies blue-noise-based dithering for linear -> sRGB conversion.
 // This prevents onscreen banding artifacts in areas with subtle gradients.
-vec3 srgb_dither(vec3 color, ivec2 ipos)
+// Only reached on the SDR path, after mapped_color has been clamped to [0,1],
+// so every value in here is display-range. diff is ~1/256 scaled by the sRGB
+// derivative; fp16 resolves that to ~0.2% of the dither amplitude.
+MP vec3 srgb_dither(MP vec3 color, ivec2 ipos)
 {
-    vec3 srgb = linear_to_srgb(color);
-    vec3 diff = srgb_to_linear(srgb + vec3(1.0/256.0)) - color;
+    MP vec3 srgb = linear_to_srgb(color);
+    MP vec3 diff = srgb_to_linear(srgb + vec3(1.0/256.0)) - color;
 
     int texnum = global_ubo.current_frame_idx & (NUM_BLUE_NOISE_TEX - 1);
     ivec2 texpos = ipos & ivec2(BLUE_NOISE_RES - 1);
-    float noise = texelFetch(TEX_BLUE_NOISE, ivec3(texpos, texnum), 0).r;
+    MP float noise = texelFetch(TEX_BLUE_NOISE, ivec3(texpos, texnum), 0).r;
 
     color = color + diff * (noise - 0.5) * 2;
     return max(vec3(0), color);

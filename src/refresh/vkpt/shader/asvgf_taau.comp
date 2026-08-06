@@ -67,7 +67,10 @@ vec3 PQDecode(vec3 image)
     return L * pq_C; // returns cd/m^2
 }
 
-vec3 PQEncode(vec3 image)
+// PQEncode ends in a clamp to [0,1], which is what makes the whole TAAU moment /
+// NCC / anti-sparkle block below fp16-safe by construction. PQDecode is the
+// opposite -- it returns cd/m^2 -- and stays at full precision.
+MP vec3 PQEncode(vec3 image)
 {
     vec3 L = image / pq_C;
     vec3 Lm = pow(max(L, 0.0), vec3(pq_m1));
@@ -103,7 +106,7 @@ void preload(ivec2 group_base, ivec2 group_size)
     }
 }
 
-void get_shared_color(ivec2 pos, ivec2 group_base, out vec3 color_pq, out int checkerboard_flags)
+void get_shared_color(ivec2 pos, ivec2 group_base, out MP vec3 color_pq, out int checkerboard_flags)
 {
     ivec2 addr = pos - group_base + ivec2(FILTER_RADIUS);
     
@@ -120,7 +123,10 @@ vec2 get_shared_motion(ivec2 pos, ivec2 group_base)
     return unpackHalf2x16(s_motion[addr.y][addr.x]);
 }
 
-void get_moments(ivec2 pos, ivec2 group_base, int r, out vec3 mom1, out vec3 mom2)
+// Operates on PQ-encoded color, so c is in [0,1], mom1 and mom2 are bounded by 9,
+// and mom2 cannot overflow the way the linear-HDR second moments in
+// asvgf_temporal.comp do.
+void get_moments(ivec2 pos, ivec2 group_base, int r, out MP vec3 mom1, out MP vec3 mom2)
 {
     mom1 = vec3(0.0);
     mom2 = vec3(0.0);
@@ -129,11 +135,11 @@ void get_moments(ivec2 pos, ivec2 group_base, int r, out vec3 mom1, out vec3 mom
     {
         for(int xx = -r; xx <= r; xx++)
         {
-            if(xx == 0 && yy == 0) 
+            if(xx == 0 && yy == 0)
                 continue;
 
             ivec2 p = pos + ivec2(xx, yy);
-            vec3 c;
+            MP vec3 c;
             int checkerboard_flags;
             get_shared_color(p, group_base, c, checkerboard_flags);
 
@@ -143,7 +149,9 @@ void get_moments(ivec2 pos, ivec2 group_base, int r, out vec3 mom1, out vec3 mom
     }
 }
 
-float get_sample_weight(vec2 delta, float scale)
+// delta is a sub-pixel offset in [-0.5,0.5] computed from full-precision
+// coordinates by the caller, so only the [0,1] result is relaxed.
+MP float get_sample_weight(vec2 delta, float scale)
 {
     return clamp(1 - scale * dot(delta, delta), 0, 1);
 }
@@ -257,17 +265,19 @@ main()
                     if(checkerboard_flags == (CHECKERBOARD_FLAG_REFLECTION | CHECKERBOARD_FLAG_REFRACTION))
                         variance_scale *= 2;
 
-                    vec3 sigma = sqrt(max(vec3(0), mom2 - mom1 * mom1));
-                    vec3 mi = mom1 - sigma * variance_scale;
-                    vec3 ma = mom1 + sigma * variance_scale;
+                    MP vec3 sigma = sqrt(max(vec3(0), mom2 - mom1 * mom1));
+                    MP vec3 mi = mom1 - sigma * variance_scale;
+                    MP vec3 ma = mom1 + sigma * variance_scale;
 
                     color_prev = clamp(color_prev, mi, ma);
                 }
 
                 // Mix the new color with the clamped previous color
+                // motion_weight stays full precision: motion is in display pixels
+                // here, so dot(motion, motion) can reach ~1e7 on a fast pan.
                 float motion_weight = smoothstep(0, 1.0f, sqrt(dot(motion, motion)));
-                float sample_weight = get_sample_weight(nearest_render_pos - int_render_pos, global_ubo.taa_output_width * global_ubo.inv_width);
-                float pixel_weight = max(motion_weight, sample_weight) * 0.1f;
+                MP float sample_weight = get_sample_weight(nearest_render_pos - int_render_pos, global_ubo.taa_output_width * global_ubo.inv_width);
+                MP float pixel_weight = max(motion_weight, sample_weight) * 0.1f;
                 pixel_weight = clamp(pixel_weight, 0, 1);
                 color_output = mix(color_prev, color_center, pixel_weight);
             }

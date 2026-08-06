@@ -271,9 +271,11 @@ main()
 	imageStore(IMG_PT_VIEW_DEPTH_A, ipos, vec4(distance_curr));
 	imageStore(IMG_PT_MOTION, ipos, vec4(motion, fwidth_depth));
 
-	vec3 primary_base_color = vec3(1);
-	float primary_metallic = 0;
-	float primary_roughness = 1;
+	// These are written to IMG_PT_BASE_COLOR_A (rgba16f) and IMG_PT_METALLIC_A
+	// (rg8) at the end of this shader, so they are already stored at <= 16 bits.
+	MP vec3 primary_base_color = vec3(1);
+	MP float primary_metallic = 0;
+	MP float primary_roughness = 1;
 	vec3 primary_emissive = vec3(0);
 	float primary_specular_factor = 1;
 	vec3 throughput = vec3(1);

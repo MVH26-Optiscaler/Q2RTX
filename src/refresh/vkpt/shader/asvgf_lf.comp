@@ -107,7 +107,8 @@ filter_image(
 
 			float depth = texelFetch(TEX_PT_VIEW_DEPTH_A, p_hires, 0).x;
 
-			float dist_z = abs(depth_center - depth) * fwidth_depth * global_ubo.flt_atrous_depth;
+			// Consumed only through exp(-dist_z), which saturates to 0.
+			MP float dist_z = abs(depth_center - depth) * fwidth_depth * global_ubo.flt_atrous_depth;
 			w *= exp(-dist_z / float(step_size * GRAD_DWN));
 			w *= wavelet_kernel[abs(xx)][abs(yy)];
 
@@ -116,7 +117,10 @@ filter_image(
 
 			if(global_ubo.flt_atrous_normal_lf > 0)
 			{
-				float GNdotGN = max(0.0, dot(geo_normal_center, geo_normal));
+				// flt_atrous_normal_lf defaults to 8, so fp16 quantization near
+				// x=1 costs ~0.8% in the weight -- unlike the HF/spec paths in
+				// asvgf_atrous.comp, where the exponent reaches 1024.
+				MP float GNdotGN = max(0.0, dot(geo_normal_center, geo_normal));
 				w_lf *= pow(GNdotGN, global_ubo.flt_atrous_normal_lf);
 			}
 			

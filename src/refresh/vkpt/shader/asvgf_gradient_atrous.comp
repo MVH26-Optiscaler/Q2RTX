@@ -81,15 +81,17 @@ filter_image(sampler2D img)
 	return sum_color;
 }
 
-// LF gradients are not normalized in the gradient_img shader - do it after the blur
-float get_gradient(float l_curr, float l_prev)
+// LF gradients are not normalized in the gradient_img shader - do it after the blur.
+// Inputs stay full precision (they carry the STORAGE_SCALE_LF-scaled magnitudes);
+// the normalized, squared result is fp16-safe.
+MP float get_gradient(float l_curr, float l_prev)
 {
 	float l_max = max(l_curr, l_prev);
 
 	if(l_max == 0)
 		return 0;
 
-	float grad = abs(l_curr - l_prev) / l_max;
+	MP float grad = abs(l_curr - l_prev) / l_max;
 	return grad * grad;
 }
 

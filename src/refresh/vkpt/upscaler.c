@@ -57,16 +57,19 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 	Resolution
 	----------
-	The model's scale factor is a property of the model, not a resolution policy.
-	viewsize/DRS choose the render extent exactly as they do for every other path;
-	the model multiplies it by its fixed factor, and whatever that overshoots the
-	display by, the final blit removes on the way out by filtering.
+	While the upscaler is on it picks the render extent itself, from the display
+	extent and the model's scale factor: display/scale, so the model's output lands
+	exactly on the display and the final blit is a 1:1 copy. viewsize and DRS do
+	not apply -- the model's scale factor is the quality setting -- and any other
+	extent either overshoots the display, allocating and moving a tensor whose
+	surplus the blit then discards, or undershoots and gets filtered back up.
 
-	So the downsample ratio is viewsize * scale / 100. With a 4x model, viewsize 25
-	lands on the display exactly and the blit is a 1:1 copy -- the cheap
-	upscale-for-performance case. Above that the extra resolution is real
-	supersampling, and at viewsize 100 the path tracer runs at native resolution
-	and the frame is 4x-downsampled: high quality, and far too slow for gameplay.
+	flt_upscaler_render_scale overrides that with a percentage of the display
+	extent. At 100 the path tracer runs at native resolution, the model outputs
+	scale times the display, and the final blit downsamples it -- supersampling
+	rather than upscaling: high quality, far too slow for gameplay, and useful
+	mostly for judging what the model does to a clean frame. Both extents are
+	produced by vkpt_upscaler_get_render_extent().
 
 	Shapes and the session
 	----------------------
@@ -86,6 +89,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	  seconds. Normally driven by the flt_upscaling menu cvar.
 	* flt_upscaler_verbose - raise ONNX Runtime logging to verbose, which is
 	  where per-node execution-provider assignment is reported.
+	* flt_upscaler_render_scale - override the render extent as a percentage of
+	  the display extent; 0 (the default) keeps display/scale. Changing it costs a
+	  session rebuild, same as changing the resolution. See the Resolution section.
 
 	Console commands
 	----------------
@@ -107,6 +113,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 cvar_t *cvar_flt_upscaler_enable = NULL;
 cvar_t *cvar_flt_upscaler_verbose = NULL;
+cvar_t *cvar_flt_upscaler_render_scale = NULL;
 
 extern cvar_t *cvar_flt_fsr_enable; // owned by fsr.c, initialized just before us
 extern cvar_t *cvar_drs_enable;     // owned by main.c; DRS and this upscaler are exclusive
@@ -166,9 +173,23 @@ static void upscaling_mode_changed(cvar_t *self)
 	upscaler_reload_model();
 }
 
+static void upscaler_render_scale_changed(cvar_t *self)
+{
+	if (self->integer != 0)
+		Cvar_ClampInteger(self, 25, 200);
+}
+
 void vkpt_upscaler_init_cvars(void)
 {
 	cvar_flt_upscaler_enable = Cvar_Get("flt_upscaler_enable", "0", CVAR_ARCHIVE);
+	// Overrides the render extent the AI upscaler renders at, as a percentage of
+	// the display extent. 0 keeps the default policy, which is display/scale so
+	// the model's output lands exactly on the display; 100 renders at display
+	// resolution and downsamples the model's output by the scale factor. See
+	// vkpt_upscaler_get_render_extent().
+	cvar_flt_upscaler_render_scale = Cvar_Get("flt_upscaler_render_scale", "0", CVAR_ARCHIVE);
+	cvar_flt_upscaler_render_scale->changed = upscaler_render_scale_changed;
+	upscaler_render_scale_changed(cvar_flt_upscaler_render_scale);
 	// Dumps ONNX Runtime's per-node execution-provider assignment at startup,
 	// which is how you confirm the model is really running on the NPU -- and, for
 	// this branch specifically, that no Transpose was left behind on the CPU.
@@ -264,6 +285,21 @@ typedef struct {
 	bool             downloaded;     // download submitted, inference not run yet
 	bool             tensor_valid;   // inference produced a usable result
 	bool             dump;           // dump_requested, captured at download time
+	// img_in is a host-visible LINEAR image blitted into directly, so there is no
+	// buf_input and no vkCmdCopyImageToBuffer. False when the device will not
+	// blit into a linear image in this format, in which case the slot falls back
+	// to an optimally-tiled img_in + buf_input + the copy.
+	bool             input_aliased;
+	// img_out is a host-visible LINEAR image the NPU writes into directly and the
+	// final blit samples, so there is no buf_output and no copy. False when the
+	// device cannot sample linear images in this format (or the driver's row
+	// pitch does not match the tensor's packing), in which case the slot falls
+	// back to buf_output + an optimally-tiled img_out + vkCmdCopyBufferToImage.
+	bool             output_aliased;
+	// The aliased image starts PREINITIALIZED and has to reach GENERAL once. It
+	// must never be transitioned from UNDEFINED afterwards: that would license
+	// the driver to discard what the NPU just wrote.
+	bool             output_layout_ready;
 } upscaler_slot_t;
 
 struct
@@ -296,6 +332,17 @@ struct
 	// One-shot flag set by the upscaler_dump console command, captured into the
 	// slot by spatial_download() so the pre/post pair covers the same frame.
 	bool             dump_requested;
+
+	// Whether the "which output path engaged" line has been printed for the
+	// current set of slots. Cleared by destroy_slots(), so each extent change
+	// reports again -- the row-pitch check is extent-dependent and can flip.
+	bool             output_path_logged;
+
+	// Handoff from vkpt_upscaler_record_upload() to vkpt_upscaler_final_blit().
+	// The upload is a copy and has to be recorded before the swapchain render
+	// pass opens, while the blit is a draw inside it, so the decision of which
+	// image to present is made in the first and consumed by the second.
+	upscaler_slot_t *blit_slot;
 
 	// Rolling cost of the NPU round trip. Accumulated over many frames because
 	// Sys_Milliseconds() truncates to whole milliseconds: a single sample carries
@@ -372,6 +419,7 @@ void vkpt_upscaler_discard(void)
 		upscaler.slots[i].downloaded = false;
 		upscaler.slots[i].tensor_valid = false;
 	}
+	upscaler.blit_slot = NULL;
 }
 
 static void ORT_API_CALL upscaler_ort_log(void *param, OrtLoggingLevel severity, const char *category,
@@ -1025,16 +1073,148 @@ static bool create_ldr_image(upscaler_image_t *img, VkExtent2D extent, const cha
 	return true;
 }
 
+// A tensor allocated in host-visible memory with LINEAR tiling, so that the NPU's
+// view of it and the GPU's are the same bytes and neither leg of the round trip
+// needs a staging copy:
+//
+//  - the output tensor is the image the final blit samples, which removes the
+//    vkCmdCopyBufferToImage that at display resolution read and wrote 8 MB a
+//    frame to move data that never changed;
+//  - the input tensor is the image the tone-mapped frame is blitted into, which
+//    removes the matching vkCmdCopyImageToBuffer. The blit still does the
+//    rgba16f -> unorm8 conversion (and the linear -> sRGB encode) for free, so
+//    nothing else has to change.
+//
+// Returns false when the device will not do `required_features` on a linear image
+// in this format, or when the driver's row pitch is not the tensor's tight
+// packing; the caller then falls back to the staging-buffer path. Adreno is a
+// unified-memory part, so the fast path is the expected one here.
+static bool create_host_linear_image(upscaler_image_t *img, VkExtent2D extent,
+	size_t required_bytes, VkImageUsageFlags usage, VkFormatFeatureFlags required_features,
+	VkImageLayout initial_layout, void **mapped, const char *name)
+{
+	VkFormatProperties props;
+	vkGetPhysicalDeviceFormatProperties(qvk.physical_device, upscaler.ldr_format, &props);
+
+	if ((props.linearTilingFeatures & required_features) != required_features)
+		return false;
+
+	VkImageCreateInfo image_info = {
+		.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType     = VK_IMAGE_TYPE_2D,
+		.format        = upscaler.ldr_format,
+		.extent        = { extent.width, extent.height, 1 },
+		.mipLevels     = 1,
+		.arrayLayers   = 1,
+		.samples       = VK_SAMPLE_COUNT_1_BIT,
+		.tiling        = VK_IMAGE_TILING_LINEAR,
+		.usage         = usage,
+		.sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+		// PREINITIALIZED for the output tensor, whose contents arrive from the
+		// host and must survive the first transition -- see
+		// upscaler_slot_t::output_layout_ready. UNDEFINED for the input tensor,
+		// which the GPU overwrites in full every frame.
+		.initialLayout = initial_layout,
+	};
+
+	if (vkCreateImage(qvk.device, &image_info, NULL, &img->image) != VK_SUCCESS)
+		return false;
+
+	// The tensor is tightly packed NHWC RGBA. If the driver pads rows, the two
+	// interpretations of the memory disagree and the aliasing is not valid.
+	VkImageSubresource subresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+	VkSubresourceLayout layout;
+	vkGetImageSubresourceLayout(qvk.device, img->image, &subresource, &layout);
+
+	if (layout.offset != 0 || layout.rowPitch != (VkDeviceSize)extent.width * UPSCALER_CHANNELS) {
+		Com_DPrintf("upscaler: %s cannot alias at %ux%u: driver wants offset %llu / row pitch "
+			"%llu, the tensor needs 0 / %u\n", name, extent.width, extent.height,
+			(unsigned long long)layout.offset, (unsigned long long)layout.rowPitch,
+			extent.width * UPSCALER_CHANNELS);
+		vkDestroyImage(qvk.device, img->image, NULL);
+		img->image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	VkMemoryRequirements mem_req;
+	vkGetImageMemoryRequirements(qvk.device, img->image, &mem_req);
+
+	if (mem_req.size < required_bytes) {
+		vkDestroyImage(qvk.device, img->image, NULL);
+		img->image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	uint32_t type_index = get_memory_type(mem_req.memoryTypeBits,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	VkMemoryAllocateInfo alloc_info = {
+		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize  = mem_req.size,
+		.memoryTypeIndex = type_index,
+	};
+
+	if (vkAllocateMemory(qvk.device, &alloc_info, NULL, &img->memory) != VK_SUCCESS) {
+		vkDestroyImage(qvk.device, img->image, NULL);
+		img->image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	if (vkBindImageMemory(qvk.device, img->image, img->memory, 0) != VK_SUCCESS ||
+		vkMapMemory(qvk.device, img->memory, 0, VK_WHOLE_SIZE, 0, mapped) != VK_SUCCESS)
+	{
+		destroy_ldr_image(img);
+		*mapped = NULL;
+		return false;
+	}
+
+	ATTACH_LABEL_VARIABLE_NAME(img->image, IMAGE, name);
+
+	// Only the output tensor is ever read through a descriptor. The input one is
+	// a pure blit target, and an image whose only usage is TRANSFER_DST cannot
+	// legally have a view at all.
+	if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
+		VkImageViewCreateInfo view_info = {
+			.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image            = img->image,
+			.viewType         = VK_IMAGE_VIEW_TYPE_2D,
+			.format           = upscaler.ldr_format,
+			.subresourceRange = {
+				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel   = 0, .levelCount = 1,
+				.baseArrayLayer = 0, .layerCount = 1,
+			},
+		};
+
+		if (vkCreateImageView(qvk.device, &view_info, NULL, &img->view) != VK_SUCCESS) {
+			vkUnmapMemory(qvk.device, img->memory);
+			destroy_ldr_image(img);
+			*mapped = NULL;
+			return false;
+		}
+	}
+
+	img->extent = extent;
+	return true;
+}
+
 // Releases one slot's staging buffers and images. Safe to call when they were
 // never allocated.
 static void destroy_slot(upscaler_slot_t *slot)
 {
 	if (slot->input_mapped) {
-		buffer_unmap(&slot->buf_input);
+		if (slot->input_aliased)
+			vkUnmapMemory(qvk.device, slot->img_in.memory);
+		else
+			buffer_unmap(&slot->buf_input);
 		slot->input_mapped = NULL;
 	}
 	if (slot->output_mapped) {
-		buffer_unmap(&slot->buf_output);
+		// Aliased slots map the image's own memory; the fallback maps a buffer.
+		if (slot->output_aliased)
+			vkUnmapMemory(qvk.device, slot->img_out.memory);
+		else
+			buffer_unmap(&slot->buf_output);
 		slot->output_mapped = NULL;
 	}
 
@@ -1048,12 +1228,17 @@ static void destroy_slot(upscaler_slot_t *slot)
 	slot->extent_out = (VkExtent2D){ 0, 0 };
 	slot->downloaded = false;
 	slot->tensor_valid = false;
+	slot->input_aliased = false;
+	slot->output_aliased = false;
+	slot->output_layout_ready = false;
 }
 
 static void destroy_slots(void)
 {
 	for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		destroy_slot(&upscaler.slots[i]);
+
+	upscaler.output_path_logged = false;
 }
 
 // (Re)allocates one slot's staging buffers and transfer images for the session's
@@ -1075,33 +1260,83 @@ static bool ensure_slot_resources(upscaler_slot_t *slot, VkExtent2D extent_in, V
 
 	// Adreno is a unified-memory part, so the transfers read/write these directly
 	// and the CPU maps them persistently -- no separate device-local copy.
-	if (buffer_create(&slot->buf_input, upscaler.input_byte_size,
-			VK_BUFFER_USAGE_TRANSFER_DST_BIT, host_props) != VK_SUCCESS ||
-		buffer_create(&slot->buf_output, upscaler.output_byte_size,
-			VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host_props) != VK_SUCCESS)
-	{
-		Com_EPrintf("upscaler: failed to allocate %ux%u tensor buffers\n", extent_in.width, extent_in.height);
-		destroy_slot(slot);
-		return false;
+
+	// Input side: one host-visible linear image serving as both the blit target
+	// and the NPU's input tensor, so the download copy disappears.
+	slot->input_aliased = create_host_linear_image(&slot->img_in, extent_in,
+		upscaler.input_byte_size, VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		VK_FORMAT_FEATURE_BLIT_DST_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+		&slot->input_mapped, "upscaler input image");
+
+	if (!slot->input_aliased) {
+		if (buffer_create(&slot->buf_input, upscaler.input_byte_size,
+				VK_BUFFER_USAGE_TRANSFER_DST_BIT, host_props) != VK_SUCCESS)
+		{
+			Com_EPrintf("upscaler: failed to allocate the %ux%u input tensor buffer\n",
+				extent_in.width, extent_in.height);
+			destroy_slot(slot);
+			return false;
+		}
+
+		buffer_attach_name(&slot->buf_input, "upscaler input tensor");
+		slot->input_mapped = buffer_map(&slot->buf_input);
+
+		if (!slot->input_mapped || !create_ldr_image(&slot->img_in, extent_in, "upscaler input image")) {
+			Com_EPrintf("upscaler: failed to set up the input staging path\n");
+			destroy_slot(slot);
+			return false;
+		}
 	}
 
-	buffer_attach_name(&slot->buf_input, "upscaler input tensor");
-	buffer_attach_name(&slot->buf_output, "upscaler output tensor");
+	// Output side: one host-visible linear image serving as both the NPU's output
+	// tensor and the image the final blit samples, so the upload copy disappears.
+	slot->output_aliased = create_host_linear_image(&slot->img_out, extent_out,
+		upscaler.output_byte_size, VK_IMAGE_USAGE_SAMPLED_BIT,
+		VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
+		VK_IMAGE_LAYOUT_PREINITIALIZED, &slot->output_mapped, "upscaler output image");
 
-	slot->input_mapped  = buffer_map(&slot->buf_input);
-	slot->output_mapped = buffer_map(&slot->buf_output);
+	if (!slot->output_aliased) {
+		if (buffer_create(&slot->buf_output, upscaler.output_byte_size,
+				VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host_props) != VK_SUCCESS)
+		{
+			Com_EPrintf("upscaler: failed to allocate the %ux%u output tensor buffer\n",
+				extent_out.width, extent_out.height);
+			destroy_slot(slot);
+			return false;
+		}
 
-	if (!slot->input_mapped || !slot->output_mapped) {
-		Com_EPrintf("upscaler: failed to map tensor buffers\n");
-		destroy_slot(slot);
-		return false;
+		buffer_attach_name(&slot->buf_output, "upscaler output tensor");
+		slot->output_mapped = buffer_map(&slot->buf_output);
+
+		if (!slot->output_mapped || !create_ldr_image(&slot->img_out, extent_out, "upscaler output image")) {
+			Com_EPrintf("upscaler: failed to set up the output staging path\n");
+			destroy_slot(slot);
+			return false;
+		}
 	}
 
-	if (!create_ldr_image(&slot->img_in, extent_in, "upscaler input image") ||
-		!create_ldr_image(&slot->img_out, extent_out, "upscaler output image"))
-	{
-		destroy_slot(slot);
-		return false;
+	if (!upscaler.output_path_logged) {
+		upscaler.output_path_logged = true;
+
+		if (slot->input_aliased) {
+			Com_Printf("upscaler: the frame is blitted straight into the %ux%u input "
+				"tensor; no download copy\n", extent_in.width, extent_in.height);
+		} else {
+			Com_WPrintf("upscaler: this device will not blit into a linear %ux%u image in "
+				"this format, so every frame pays a %.1f MB staging copy to download the "
+				"frame\n", extent_in.width, extent_in.height,
+				(double)upscaler.input_byte_size / (1024.0 * 1024.0));
+		}
+
+		if (slot->output_aliased) {
+			Com_Printf("upscaler: NPU writes the %ux%u output straight into the sampled "
+				"image; no upload copy\n", extent_out.width, extent_out.height);
+		} else {
+			Com_WPrintf("upscaler: this device cannot sample a linear %ux%u image in this "
+				"format, so every frame pays a %.1f MB staging copy to upload the result\n",
+				extent_out.width, extent_out.height,
+				(double)upscaler.output_byte_size / (1024.0 * 1024.0));
+		}
 	}
 
 	slot->extent_in = extent_in;
@@ -1153,13 +1388,74 @@ bool vkpt_upscaler_is_enabled(void)
 	return spatial_is_active();
 }
 
-// The model's fixed scale factor, or 0 when nothing is going to run. This is a
-// property of the loaded model, not a resolution policy: the render extent comes
-// from viewsize/DRS like every other path, and the factor only says how much
-// bigger than that the model's output will be.
+// The model's fixed scale factor, or 0 when nothing is going to run. While it is
+// non-zero the render extent comes from vkpt_upscaler_get_render_extent() below
+// and viewsize does not apply. Note this deliberately does not consult the
+// session: the session is built lazily against the render extent, so deriving the
+// extent from a session-dependent value would be circular.
 uint32_t vkpt_upscaler_get_scale(void)
 {
 	return spatial_is_active() ? upscaler_models[upscaler.selected_model - 1].scale : 0;
+}
+
+// The render extent to use while the upscaler is active, given the display
+// extent. This is the whole resolution policy for the path, kept here rather
+// than in get_render_extent() because only this file knows what the session can
+// actually be built for.
+//
+// flt_upscaler_render_scale 0 (the default) renders at display/scale, the one
+// extent whose upscaled output lands on the display, so the final blit is a 1:1
+// copy. Any other value is a percentage of the display extent, which overrides
+// that: 100 renders at display resolution and hands the model a native-resolution
+// frame, whose scale-times-larger output the final blit then downsamples. That is
+// supersampling rather than upscaling -- the path tracer does full-resolution
+// work and the tensors grow by scale^2 -- so it is a quality/analysis mode, not a
+// way to go faster.
+VkExtent2D vkpt_upscaler_get_render_extent(VkExtent2D display)
+{
+	uint32_t scale = vkpt_upscaler_get_scale();
+	VkExtent2D result = display;
+
+	if (scale <= 1)
+		return result;
+
+	int percent = cvar_flt_upscaler_render_scale ? cvar_flt_upscaler_render_scale->integer : 0;
+
+	if (percent > 0)
+	{
+		result.width  = (uint32_t)(display.width  * (float)percent / 100.f);
+		result.height = (uint32_t)(display.height * (float)percent / 100.f);
+	}
+	else
+	{
+		result.width  = (display.width  + scale - 1) / scale;
+		result.height = (display.height + scale - 1) / scale;
+	}
+
+	// Round the width up to UPSCALER_WIDTH_ALIGN rather than the usual 2. The
+	// tensor is tightly packed, so the upscaler can only alias its staging
+	// images -- and skip a copy in each direction -- when the driver's row pitch
+	// for a linear image equals width * 4 bytes. Drivers align that pitch, so an
+	// unaligned width silently costs both copies back. Rounding up can overshoot
+	// the display by a few pixels, which the final blit already resolves.
+	result.width = (result.width + (UPSCALER_WIDTH_ALIGN - 1)) & ~(UPSCALER_WIDTH_ALIGN - 1);
+	result.height = (result.height + 1) & ~1;
+
+	// Clamp to what load_session() will accept: it refuses an extent whose
+	// output crosses UPSCALER_MAX_EDGE, and a refusal disables the upscaler for
+	// the rest of the session rather than falling back. Reachable from
+	// flt_upscaler_render_scale alone -- a 4K display at 100% with the 4x model
+	// asks for a 15360-pixel-wide output -- so clamp instead of failing.
+	uint32_t max_edge = UPSCALER_MAX_EDGE / scale;
+	if (result.width > max_edge)
+		result.width = max_edge & ~(UPSCALER_WIDTH_ALIGN - 1);
+	if (result.height > max_edge)
+		result.height = max_edge & ~1u;
+
+	result.width  = max(result.width, UPSCALER_WIDTH_ALIGN);
+	result.height = max(result.height, 2u);
+
+	return result;
 }
 
 // Brings the session in line with the render extent, rebuilding it when they
@@ -1215,10 +1511,12 @@ static bool ensure_session(VkExtent2D extent)
 	return true;
 }
 
-// Copies the tone-mapped frame into `slot`'s input tensor, from
-// vkpt_upscaler_do(). No shader: the blit converts rgba16f to unorm8 (clamping
-// to [0,1] on the way, which is what the old pack shader did explicitly) and the
-// copy lays the result out as the tightly packed NHWC RGBA the model wants.
+// Puts the tone-mapped frame into `slot`'s input tensor, from
+// vkpt_upscaler_do(). No shader: the blit converts rgba16f to unorm8, clamping
+// to [0,1] and encoding sRGB on the way, which is what the old pack shader did
+// explicitly. When the input tensor is an aliased linear image the blit writes
+// the tightly packed NHWC RGBA the model wants directly and that is the whole
+// pass; otherwise a copy to the staging buffer lays it out afterwards.
 static VkResult spatial_download(VkCommandBuffer cmd_buf, upscaler_slot_t *slot)
 {
 	slot->downloaded = false;
@@ -1247,15 +1545,24 @@ static VkResult spatial_download(VkCommandBuffer cmd_buf, upscaler_slot_t *slot)
 		.newLayout        = VK_IMAGE_LAYOUT_GENERAL,
 	);
 
-	// UNDEFINED as the old layout: the blit overwrites every texel, so there is
-	// nothing to preserve and nothing to track across frames.
+	// The aliased input image is host-visible and read by the CPU straight after,
+	// so it is blitted into in GENERAL rather than TRANSFER_DST_OPTIMAL -- an
+	// optimal layout would license the driver to swizzle, which the tensor's
+	// tight NHWC packing cannot tolerate.
+	//
+	// UNDEFINED as the old layout either way: the blit overwrites every texel, so
+	// there is nothing to preserve and nothing to track across frames.
+	const VkImageLayout blit_dst_layout = slot->input_aliased
+		? VK_IMAGE_LAYOUT_GENERAL
+		: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
 	IMAGE_BARRIER(cmd_buf,
 		.image            = slot->img_in.image,
 		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
 		.srcAccessMask    = 0,
 		.dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
 		.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-		.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		.newLayout        = blit_dst_layout,
 	);
 
 	VkImageBlit blit = {
@@ -1266,40 +1573,60 @@ static VkResult spatial_download(VkCommandBuffer cmd_buf, upscaler_slot_t *slot)
 	};
 	vkCmdBlitImage(cmd_buf,
 		qvk.images[VKPT_IMG_TAA_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-		slot->img_in.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		slot->img_in.image, blit_dst_layout,
 		1, &blit, VK_FILTER_NEAREST);
 
-	IMAGE_BARRIER(cmd_buf,
-		.image            = slot->img_in.image,
-		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-		.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-		.dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
-		.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	);
+	if (slot->input_aliased) {
+		// Nothing to copy: the blit already landed in the tensor's own memory.
+		// Just make it visible to the host read that next frame's
+		// spatial_run_inference() will do once download_fence reports it done.
+		IMAGE_BARRIER_STAGES(cmd_buf,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_HOST_BIT,
+			.image            = slot->img_in.image,
+			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+			.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask    = VK_ACCESS_HOST_READ_BIT,
+			.oldLayout        = VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout        = VK_IMAGE_LAYOUT_GENERAL,
+		);
+	} else {
+		IMAGE_BARRIER(cmd_buf,
+			.image            = slot->img_in.image,
+			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+			.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT,
+			.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		);
 
-	// bufferRowLength/bufferImageHeight 0 means tightly packed to imageExtent,
-	// which is exactly the tensor's stride.
-	VkBufferImageCopy copy = {
-		.bufferOffset      = 0,
-		.bufferRowLength   = 0,
-		.bufferImageHeight = 0,
-		.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-		.imageOffset       = { 0, 0, 0 },
-		.imageExtent       = { extent_in.width, extent_in.height, 1 },
-	};
-	vkCmdCopyImageToBuffer(cmd_buf, slot->img_in.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		slot->buf_input.buffer, 1, &copy);
+		// bufferRowLength/bufferImageHeight 0 means tightly packed to imageExtent,
+		// which is exactly the tensor's stride.
+		VkBufferImageCopy copy = {
+			.bufferOffset      = 0,
+			.bufferRowLength   = 0,
+			.bufferImageHeight = 0,
+			.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+			.imageOffset       = { 0, 0, 0 },
+			.imageExtent       = { extent_in.width, extent_in.height, 1 },
+		};
+		vkCmdCopyImageToBuffer(cmd_buf, slot->img_in.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			slot->buf_input.buffer, 1, &copy);
 
-	// Make the copy visible to the host read that next frame's
-	// spatial_run_inference() will do once download_fence reports it done.
-	BUFFER_BARRIER(cmd_buf,
-		.buffer        = slot->buf_input.buffer,
-		.offset        = 0,
-		.size          = VK_WHOLE_SIZE,
-		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-	);
+		// Make the copy visible to the host read that next frame's
+		// spatial_run_inference() will do once download_fence reports it done.
+		// VK_PIPELINE_STAGE_HOST_BIT has to be named: ALL_COMMANDS does not cover
+		// it, so BUFFER_BARRIER's default stages leave HOST_READ unsupported.
+		BUFFER_BARRIER_STAGES(cmd_buf,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_HOST_BIT,
+			.buffer        = slot->buf_input.buffer,
+			.offset        = 0,
+			.size          = VK_WHOLE_SIZE,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+		);
+	}
 
 	END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_DOWNLOAD);
 	END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER);
@@ -1440,7 +1767,7 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 	return spatial_download(cmd_buf, spatial_slot_cur());
 }
 
-VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
+void vkpt_upscaler_record_upload(VkCommandBuffer cmd_buf)
 {
 	// One frame behind: the tensor this uploads was downloaded last frame and
 	// inferred at the top of this one. A slot's result is good for exactly one
@@ -1453,16 +1780,42 @@ VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 	// leaves the buffers destroyed, a failed inference leaves the tensor holding
 	// an older frame, and on a cold start there is no previous frame at all.
 	// Presenting any of those would show garbage or read an already-freed
-	// buffer, so fall back to the tone-mapped frame, which is below display
-	// resolution here, hence the filtered blit.
-	if (!tensor_valid) {
-		bool needs_filter = qvk.extent_taa_output.width  != qvk.extent_unscaled.width
-		                 || qvk.extent_taa_output.height != qvk.extent_unscaled.height;
-		return vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output,
-			needs_filter, warp);
-	}
+	// buffer, so leave blit_slot null and let the blit fall back to the
+	// tone-mapped frame.
+	upscaler.blit_slot = tensor_valid ? slot : NULL;
+
+	if (!tensor_valid)
+		return;
 
 	BEGIN_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_UPLOAD);
+
+	// The aliased path has nothing to upload -- the inference wrote the image's
+	// own memory. All it needs is to leave PREINITIALIZED once, and never from
+	// UNDEFINED, which would let the driver discard those writes. Subsequent
+	// frames need no barrier at all: vkQueueSubmit makes host writes visible to
+	// the device, and the image stays in GENERAL, which is the layout
+	// vkpt_final_blit_view() samples it in.
+	if (slot->output_aliased) {
+		if (!slot->output_layout_ready) {
+			// Named stages, not IMAGE_BARRIER's ALL_COMMANDS: that does not
+			// include VK_PIPELINE_STAGE_HOST_BIT, so a HOST_WRITE source access
+			// has nowhere to hang off it.
+			IMAGE_BARRIER_STAGES(cmd_buf,
+				VK_PIPELINE_STAGE_HOST_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				.image            = slot->img_out.image,
+				.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+				.srcAccessMask    = VK_ACCESS_HOST_WRITE_BIT,
+				.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
+				.oldLayout        = VK_IMAGE_LAYOUT_PREINITIALIZED,
+				.newLayout        = VK_IMAGE_LAYOUT_GENERAL,
+			);
+			slot->output_layout_ready = true;
+		}
+
+		END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_UPLOAD);
+		return;
+	}
 
 	// No host-write barrier: the inference wrote buf_output before this command
 	// buffer was submitted, and vkQueueSubmit makes host writes visible to the
@@ -1497,10 +1850,27 @@ VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 	);
 
 	END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_UPLOAD);
+}
 
-	// The model always multiplies by its fixed factor, so the result overshoots
-	// the display by viewsize * scale / 100 and the blit resolves the excess.
-	// At viewsize 100 / scale the two agree and this is a 1:1 copy.
+VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
+{
+	upscaler_slot_t *slot = upscaler.blit_slot;
+	upscaler.blit_slot = NULL;
+
+	// vkpt_upscaler_record_upload() had nothing to present. The tone-mapped
+	// frame is below display resolution here, hence the filtered blit.
+	if (!slot) {
+		bool needs_filter = qvk.extent_taa_output.width  != qvk.extent_unscaled.width
+		                 || qvk.extent_taa_output.height != qvk.extent_unscaled.height;
+		return vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output,
+			needs_filter, warp);
+	}
+
+	// The default render extent is display/scale, so extent_out normally lands
+	// exactly on the display and this is a 1:1 copy. It can still be off by a
+	// pixel or two when the display extent is not a multiple of the scale and the
+	// division rounded up, and it is scale times the display under
+	// flt_upscaler_render_scale 100 -- both of which the filtered path covers.
 	bool needs_filter = !upscaler_extents_equal(slot->extent_out, qvk.extent_unscaled);
 
 	return vkpt_final_blit_view(cmd_buf, slot->img_out.view, slot->extent_out, needs_filter, warp);
@@ -1544,9 +1914,18 @@ uint32_t vkpt_upscaler_get_scale(void)
 	return 0;
 }
 
+VkExtent2D vkpt_upscaler_get_render_extent(VkExtent2D display)
+{
+	return display;
+}
+
 VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 {
 	return VK_SUCCESS;
+}
+
+void vkpt_upscaler_record_upload(VkCommandBuffer cmd_buf)
+{
 }
 
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)

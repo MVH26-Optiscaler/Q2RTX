@@ -238,11 +238,11 @@ static inline bool extents_equal(VkExtent2D a, VkExtent2D b)
 
 static bool is_accumulation_rendering_active(void);
 
-// Whether the NPU upscaler runs this frame. It does not influence the render
-// extent -- viewsize/DRS pick that and the model scales whatever it is given --
-// but several passes still need to agree on whether it is in the frame graph.
-// Accumulation ("photo") mode renders at full resolution over many frames for
-// quality and reconstructs nothing spatially, so it wins.
+// Whether the NPU upscaler runs this frame. It picks the render extent when it
+// does (see get_render_extent() below), and several passes need to agree on
+// whether it is in the frame graph. Accumulation ("photo") mode renders at full
+// resolution over many frames for quality and reconstructs nothing spatially, so
+// it wins.
 static bool upscaler_active_this_frame(void)
 {
 	return vkpt_upscaler_get_scale() > 1 && !is_accumulation_rendering_active();
@@ -250,6 +250,15 @@ static bool upscaler_active_this_frame(void)
 
 static VkExtent2D get_render_extent(void)
 {
+	// The NPU upscaler owns its own resolution policy: by default it renders at
+	// display/scale, the one extent whose output lands exactly on the display, and
+	// flt_upscaler_render_scale can override that with a percentage of the display
+	// extent (100 = render at display resolution and downsample the model's
+	// output). Either way it is derived from the display extent, so viewsize has no
+	// effect while the upscaler is active. See vkpt_upscaler_get_render_extent().
+	if (upscaler_active_this_frame())
+		return vkpt_upscaler_get_render_extent(qvk.extent_unscaled);
+
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -277,6 +286,25 @@ static VkExtent2D get_render_extent(void)
 static VkExtent2D get_screen_image_extent(void)
 {
 	VkExtent2D result;
+
+	// The NPU upscaler is the only path whose final image is produced outside the
+	// screen images entirely -- it owns its own output image, and
+	// evaluate_taa_settings() pins extent_taa_output to the render extent. So
+	// nothing downstream of the path tracer needs display-sized storage, and
+	// allocating all ~68 screen images at the display extent (which is what the
+	// max() below otherwise does) would keep four times the working set resident
+	// at 2x, sixteen times at 4x. The bytes moved per frame are unchanged; what
+	// improves is how much of it stays in the system cache.
+	//
+	// DRS is refused outright while the upscaler is on, so this needs no
+	// interaction with the branch below.
+	if (upscaler_active_this_frame())
+	{
+		result = qvk.extent_render;
+		result.width = (result.width + 1) & ~1;
+		return result;
+	}
+
 	if (cvar_drs_enable->integer)
 	{
 		int image_scale = max(cvar_drs_minscale->integer, cvar_drs_maxscale->integer);
@@ -312,8 +340,20 @@ vkpt_initialize_all(VkptInitFlags_t init_flags)
 	qvk.extent_render = get_render_extent();
 	qvk.extent_screen_images = get_screen_image_extent();
 
-	qvk.extent_taa_images.width = max(qvk.extent_screen_images.width, qvk.extent_unscaled.width);
-	qvk.extent_taa_images.height = max(qvk.extent_screen_images.height, qvk.extent_unscaled.height);
+	// TAA_OUTPUT and ASVGF_TAA normally have to reach the display extent because
+	// TAAU resolves into them. Under the NPU upscaler they do not: it pins
+	// extent_taa_output to the render extent and its own output image carries the
+	// frame the rest of the way, so sizing these to the display would allocate
+	// three quarters of them (at 2x) to never be touched.
+	if (upscaler_active_this_frame())
+	{
+		qvk.extent_taa_images = qvk.extent_screen_images;
+	}
+	else
+	{
+		qvk.extent_taa_images.width = max(qvk.extent_screen_images.width, qvk.extent_unscaled.width);
+		qvk.extent_taa_images.height = max(qvk.extent_screen_images.height, qvk.extent_unscaled.height);
+	}
 
 	qvk.gpu_slice_width = (qvk.extent_render.width + qvk.device_count - 1) / qvk.device_count;
 
@@ -3683,44 +3723,65 @@ R_EndFrame_RTX(void)
 	if (!upscaler_blits_this_frame)
 		vkpt_upscaler_discard();
 
-	if (frame_ready)
+	// The NPU upscaler's upload is a buffer-to-image copy, which cannot be
+	// recorded inside a render pass, so it goes before the pass is opened. The
+	// blit it feeds is a draw inside it.
+	if (frame_ready && upscaler_blits_this_frame)
+		vkpt_upscaler_record_upload(cmd_buf);
+
+	// The final blit and the HUD both target the swapchain. They used to open a
+	// render pass each, which on a tiler is two full load/store cycles over the
+	// whole image; one pass with both draws makes it one store.
+	bool draw_hud = vkpt_draw_have_stretch_pics();
+
+	if (frame_ready || draw_hud)
 	{
-		bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
-		if (upscaler_blits_this_frame)
-		{
-			vkpt_upscaler_final_blit(cmd_buf, waterwarp);
-		}
-		else if (vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
-		{
-			vkpt_fsr_final_blit(cmd_buf, waterwarp);
-		}
-		else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
-		{
-			// TAAU normally lands this at display resolution, so an unfiltered
-			// blit is a 1:1 copy. It does not when the NPU upscaler has pinned
-			// extent_taa_output to the render extent and then sits out the frame
-			// (menu mode), which would otherwise leave a nearest-neighbour
-			// upscale of the render-resolution image.
-			bool needs_filter = !extents_equal(qvk.extent_taa_output, qvk.extent_unscaled);
-			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, needs_filter, waterwarp);
-		}
-		else
-		{
-			VkExtent2D extent_unscaled_half;
-			extent_unscaled_half.width = qvk.extent_unscaled.width / 2;
-			extent_unscaled_half.height = qvk.extent_unscaled.height / 2;
+		// The blit's quad covers the entire render area, so when it runs there is
+		// nothing worth loading into tile memory. Without it the HUD composites
+		// onto whatever is already in the swapchain image and the load is real.
+		vkpt_draw_begin_swapchain_pass(cmd_buf, frame_ready);
 
-			if (extents_equal(qvk.extent_render, qvk.extent_unscaled) ||
-				(extents_equal(qvk.extent_render, extent_unscaled_half) && drs_effective_scale == 0)) // don't do nearest filter 2x upscale with DRS enabled
-				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
+		if (frame_ready)
+		{
+			bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
+			if (upscaler_blits_this_frame)
+			{
+				vkpt_upscaler_final_blit(cmd_buf, waterwarp);
+			}
+			else if (vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
+			{
+				vkpt_fsr_final_blit(cmd_buf, waterwarp);
+			}
+			else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
+			{
+				// TAAU normally lands this at display resolution, so an unfiltered
+				// blit is a 1:1 copy. It does not when the NPU upscaler has pinned
+				// extent_taa_output to the render extent and then sits out the frame
+				// (menu mode), which would otherwise leave a nearest-neighbour
+				// upscale of the render-resolution image.
+				bool needs_filter = !extents_equal(qvk.extent_taa_output, qvk.extent_unscaled);
+				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, needs_filter, waterwarp);
+			}
 			else
-				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, true, waterwarp);
+			{
+				VkExtent2D extent_unscaled_half;
+				extent_unscaled_half.width = qvk.extent_unscaled.width / 2;
+				extent_unscaled_half.height = qvk.extent_unscaled.height / 2;
+
+				if (extents_equal(qvk.extent_render, qvk.extent_unscaled) ||
+					(extents_equal(qvk.extent_render, extent_unscaled_half) && drs_effective_scale == 0)) // don't do nearest filter 2x upscale with DRS enabled
+					vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
+				else
+					vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, true, waterwarp);
+			}
+
+			frame_ready = false;
 		}
 
-		frame_ready = false;
-	}
+		vkpt_draw_submit_stretch_pics(cmd_buf);
 
-	vkpt_draw_submit_stretch_pics(cmd_buf);
+		vkpt_draw_end_swapchain_pass(cmd_buf);
+	}
 
 	VkSemaphore wait_semaphores[] = { qvk.semaphores[qvk.current_frame_index][0].image_available };
 	VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };

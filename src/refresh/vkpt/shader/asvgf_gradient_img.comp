@@ -42,16 +42,19 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // Gradient for HF and SPEC channels is computed as the relative difference between
 // path tracer outputs on the current and previous frame, for a given gradient pixel. 
-float get_gradient(float l_curr, float l_prev)
+// The inputs are raw luminances that can reach the RGBE cap, so they stay at full
+// precision. The ratio is normalized to [0,1] and then squared, so the result is
+// fp16-safe, and the l_max == 0 guard rules out 0/0.
+MP float get_gradient(float l_curr, float l_prev)
 {
 	float l_max = max(l_curr, l_prev);
 
 	if(l_max == 0)
 		return 0;
 
-	float ret = abs(l_curr - l_prev) / l_max;
+	MP float ret = abs(l_curr - l_prev) / l_max;
 	ret *= ret; // make small changes less significant
-	
+
 	return ret;
 }
 
