@@ -699,6 +699,11 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
 // dispatch has been submitted, and before vkpt_upscaler_final_blit().
 VkResult vkpt_upscaler_run_inference(void);
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
+// The queue drain and the NPU inference both happen on the CPU between submits,
+// so no GPU timestamp can see them. draw_profiler() reads them from here instead
+// and draws them alongside the GPU rows. False if no timings are available yet.
+bool vkpt_upscaler_get_cpu_timings(double *stall_ms, double *stall_avg_ms,
+	double *infer_ms, double *infer_avg_ms);
 
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);

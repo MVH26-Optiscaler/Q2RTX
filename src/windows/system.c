@@ -876,6 +876,18 @@ unsigned Sys_Milliseconds(void)
     return tm.QuadPart * 1000ULL / timer_freq.QuadPart;
 }
 
+uint64_t Sys_Nanoseconds(void)
+{
+    LARGE_INTEGER tm;
+    QueryPerformanceCounter(&tm);
+
+    // Split into whole seconds and remainder before scaling: the counter is
+    // measured from boot, so counter * 1e9 overflows 64 bits within a day.
+    uint64_t freq = timer_freq.QuadPart;
+    uint64_t ticks = tm.QuadPart;
+    return (ticks / freq) * 1000000000ULL + (ticks % freq) * 1000000000ULL / freq;
+}
+
 void Sys_AddDefaultConfig(void)
 {
 }

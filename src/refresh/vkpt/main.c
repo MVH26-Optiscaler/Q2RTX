@@ -3375,8 +3375,9 @@ R_RenderFrame_RTX(refdef_t *fd)
 			vkCmdCopyBuffer(post_cmd_buf, qvk.buf_readback.buffer, qvk.buf_readback_staging[qvk.current_frame_index].buffer, 1, &copyRegion);
 		}
 
-		_VK(vkpt_profiler_query(post_cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
-
+		// The PROFILER_FRAME_TIME stop deliberately does not go here: the final
+		// blit, and with the NPU upscaler the queue drain and the reconstruct
+		// pass, are all still ahead. R_EndFrame_RTX() closes the query instead.
 		vkpt_submit_command_buffer_simple(post_cmd_buf, qvk.queue_graphics, true);
 
 		// The NPU runs on the CPU's side of the fence: the pack dispatch above
@@ -3707,6 +3708,11 @@ R_EndFrame_RTX(void)
 			else
 				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, true, waterwarp);
 		}
+
+		// Closes the query opened in the trace command buffer. frame_ready is
+		// set unconditionally at the end of the render path, so it is true
+		// exactly when the matching PROFILER_START was written this frame.
+		_VK(vkpt_profiler_query(cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
 
 		frame_ready = false;
 	}

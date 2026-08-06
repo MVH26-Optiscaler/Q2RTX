@@ -260,18 +260,14 @@ vkpt_profiler_next_frame(VkCommandBuffer cmd_buf)
 	return VK_SUCCESS;
 }
 
+// Draws one label plus its imm/avg pair. Split out of draw_query() so the
+// CPU-timed upscaler rows below format identically to the GPU ones.
 static void
-draw_query(int x, int y, qhandle_t font, const char *enum_name, int idx)
+draw_row(int x, int y, qhandle_t font, const char *label, double ms, double avg_ms)
 {
 	char buf[256];
-	int i;
-	for(i = 0; i < LENGTH(buf) - 1 && enum_name[i]; i++)
-		buf[i] = enum_name[i] == '_' ? ' ' : (char)tolower(enum_name[i]); 
-	buf[i] = 0;
 
-	R_DrawString(x, y, 0, 128, buf, font);
-	double ms = vkpt_get_profiler_result(idx);
-	double avg_ms = ((double)profiler_data.samples[idx].accumulated / (profiler_data.samples[idx].num_samples * 1e6)) * qvk.timestampPeriod;
+	R_DrawString(x, y, 0, 128, label, font);
 
 	if(ms > 0.005)
 		snprintf(buf, sizeof buf, "%8.2f ms %8.2f ms", ms, avg_ms);
@@ -281,6 +277,21 @@ draw_query(int x, int y, qhandle_t font, const char *enum_name, int idx)
 		snprintf(buf, sizeof buf, "       N/A");
 
 	R_DrawString(x + 256, y, 0, 128, buf, font);
+}
+
+static void
+draw_query(int x, int y, qhandle_t font, const char *enum_name, int idx)
+{
+	char buf[256];
+	int i;
+	for(i = 0; i < LENGTH(buf) - 1 && enum_name[i]; i++)
+		buf[i] = enum_name[i] == '_' ? ' ' : (char)tolower(enum_name[i]);
+	buf[i] = 0;
+
+	double ms = vkpt_get_profiler_result(idx);
+	double avg_ms = ((double)profiler_data.samples[idx].accumulated / (profiler_data.samples[idx].num_samples * 1e6)) * qvk.timestampPeriod;
+
+	draw_row(x, y, font, buf, ms, avg_ms);
 }
 
 void
@@ -348,11 +359,21 @@ draw_profiler(int enable_asvgf)
 	}
 	if(vkpt_upscaler_is_enabled())
 	{
-		// The NPU inference itself runs on the CPU between submits, so it can't
-		// be timed with GPU timestamps -- upscaler.c reports it separately.
+		// PROFILER_UPSCALER spans pack through reconstruct, which means it also
+		// covers the stretch of GPU idle while the CPU drives the NPU. So unlike
+		// every other group here it is wall-clock rather than GPU-busy, and it is
+		// not the sum of its two GPU children -- the difference is the two CPU
+		// rows below, which no GPU timestamp can see.
 		PROFILER_DO(PROFILER_UPSCALER, 1);
 		PROFILER_DO(PROFILER_UPSCALER_PACK, 2);
 		PROFILER_DO(PROFILER_UPSCALER_UNPACK, 2);
+
+		double stall_ms, stall_avg_ms, infer_ms, infer_avg_ms;
+		if(vkpt_upscaler_get_cpu_timings(&stall_ms, &stall_avg_ms, &infer_ms, &infer_avg_ms))
+		{
+			draw_row(x, y, font, "upscaler stall (cpu)", stall_ms, stall_avg_ms); y += 10;
+			draw_row(x, y, font, "upscaler inference (cpu)", infer_ms, infer_avg_ms); y += 10;
+		}
 	}
 #undef PROFILER_DO
 

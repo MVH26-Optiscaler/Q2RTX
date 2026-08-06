@@ -72,6 +72,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "shared/shared.h"
 #include "common/common.h"
 #include "vkpt.h"
+// vkpt.h does not pull this in. Without it Sys_Nanoseconds() is implicitly
+// declared as returning int and its timestamps are truncated to 32 bits, which
+// wraps every few seconds and makes the timing deltas below go negative.
+#include "system/system.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -79,8 +83,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 cvar_t *cvar_flt_nss_enable = NULL;
 cvar_t *cvar_flt_upscaler_verbose = NULL;
 
-extern cvar_t *cvar_flt_fsr_enable; // owned by fsr.c, initialized just before us
-extern cvar_t *cvar_flt_taa;        // owned by main.c's UBO_CVAR_LIST, registered just before us
+extern cvar_t *cvar_flt_fsr_enable;    // owned by fsr.c, initialized just before us
+extern cvar_t *cvar_flt_taa;           // owned by main.c's UBO_CVAR_LIST, registered just before us
+extern cvar_t *cvar_profiler_samples;  // owned by main.c; the CPU timings below average over the same window
 
 // Brings the model in line with flt_nss_enable. No-op until the ONNX Runtime
 // side is up, and cheap when the selection did not actually change.
@@ -197,15 +202,31 @@ struct
 	// Set once inference has actually filled the output tensors, so the blit can
 	// tell a real result from a frame where the pass bailed.
 	bool             tensor_valid;
+	// PROFILER_UPSCALER's start timestamp was written this frame and still needs
+	// its matching stop. The pair spans two command buffers (pack is recorded in
+	// the post command buffer, reconstruct in the one R_EndFrame_RTX builds), so
+	// it cannot be a BEGIN/END_PERF_MARKER -- those also push a debug-utils label,
+	// which has to balance within a single command buffer.
+	bool             timing_open;
 
 	// One-shot flag set by the upscaler_dump console command, consumed and
 	// cleared by nss_run_inference().
 	bool             dump_requested;
 
-	// Rolling cost of the NPU round trip. Accumulated over many frames because
-	// Sys_Milliseconds() is far too coarse to time a single frame's inference.
-	unsigned         inference_ms_accum;
-	unsigned         inference_frames;
+	// Cost of the NPU round trip, split into the queue drain that has to happen
+	// before the packed tensor can be read on the host and the inference itself.
+	// Both are CPU-side, so no GPU timestamp can see them; they are reported to
+	// draw_profiler() through vkpt_upscaler_get_cpu_timings() instead. Immediate
+	// value plus a block average over the last `timing_count` frames.
+	uint64_t         stall_ns, infer_ns;
+	uint64_t         stall_ns_accum, infer_ns_accum;
+	unsigned         timing_count;
+	// Last completed block average, held so the overlay has something stable to
+	// show while the next block fills.
+	double           stall_avg_ms, infer_avg_ms;
+	// Frames since the last console report, independent of the overlay's block.
+	unsigned         report_frames;
+	uint64_t         report_infer_ns_accum;
 } nss;
 
 // Implementations sit further down; forward-declared here so the entry points
@@ -604,6 +625,19 @@ VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 	return nss_final_blit(cmd_buf, warp);
 }
 
+bool vkpt_upscaler_get_cpu_timings(double *stall_ms, double *stall_avg_ms,
+	double *infer_ms, double *infer_avg_ms)
+{
+	if (!nss_is_active())
+		return false;
+
+	*stall_ms     = (double)nss.stall_ns * 1e-6;
+	*infer_ms     = (double)nss.infer_ns * 1e-6;
+	*stall_avg_ms = nss.stall_avg_ms;
+	*infer_avg_ms = nss.infer_avg_ms;
+	return true;
+}
+
 // ========================================================================== //
 
 static bool nss_load_model(void)
@@ -686,6 +720,15 @@ static void nss_unload_model(void)
 	nss.model_loaded = false;
 	nss.width = 0;
 	nss.height = 0;
+
+	// A different model has a different cost, so nothing gathered under the old
+	// one should blend into the first average reported under the new one.
+	nss.stall_ns = nss.infer_ns = 0;
+	nss.stall_ns_accum = nss.infer_ns_accum = 0;
+	nss.timing_count = 0;
+	nss.stall_avg_ms = nss.infer_avg_ms = 0.0;
+	nss.report_infer_ns_accum = 0;
+	nss.report_frames = 0;
 }
 
 // (Re)allocates the fixed-size tensor staging buffers and points the
@@ -888,11 +931,19 @@ static VkResult nss_do(VkCommandBuffer cmd_buf)
 {
 	nss.packed_this_frame = false;
 	nss.tensor_valid = false;
+	nss.timing_open = false;
 
 	if (!nss.pipelines_ready)
 		return VK_SUCCESS;
 
-	BEGIN_PERF_MARKER(cmd_buf, PROFILER_UPSCALER);
+	// Opened here and closed at the end of nss_final_blit(), so this covers the
+	// whole NSS step: pack, the queue drain, the inference, and reconstruct. The
+	// GPU is idle for the middle of that span, and the timestamp counter keeps
+	// running through it -- which is the point. This row is the wall-clock cost
+	// of the upscaler, not the sum of its two GPU children.
+	_VK(vkpt_profiler_query(cmd_buf, PROFILER_UPSCALER, PROFILER_START));
+	nss.timing_open = true;
+
 	BEGIN_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_PACK);
 
 	nss_bind_pipeline(cmd_buf, nss.pipeline_pack);
@@ -912,7 +963,6 @@ static VkResult nss_do(VkCommandBuffer cmd_buf)
 	BARRIER_COMPUTE(cmd_buf, qvk.images[VKPT_IMG_NSS_LUMA_DERIV_A]);
 
 	END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_PACK);
-	END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER);
 
 	nss.packed_this_frame = true;
 
@@ -924,25 +974,43 @@ static VkResult nss_do(VkCommandBuffer cmd_buf)
 // nss_final_blit(). One inference for the whole frame.
 static VkResult nss_run_inference(void)
 {
-	if (!nss.packed_this_frame)
+	if (!nss.packed_this_frame) {
+		// The pass sat this frame out (menu mode, accumulation rendering, or
+		// pipelines not up yet). Drop the timings the same way the GPU rows drop
+		// theirs when their queries go unused, so the whole upscaler group blanks
+		// together instead of leaving these two showing a stale number.
+		nss.stall_ns = nss.infer_ns = 0;
+		nss.stall_ns_accum = nss.infer_ns_accum = 0;
+		nss.timing_count = 0;
+		nss.stall_avg_ms = nss.infer_avg_ms = 0.0;
 		return VK_SUCCESS;
+	}
 
 	nss.packed_this_frame = false;
 
 	bool dump = nss.dump_requested;
 	nss.dump_requested = false;
 
+	// The drain is a real per-frame cost of running the NPU on the host side of
+	// the fence, and no GPU timestamp can see it -- it is exactly the window in
+	// which the GPU has nothing queued. Timed separately from the inference so
+	// the overlay can attribute the two independently.
+	uint64_t time_stall_begin = Sys_Nanoseconds();
 	vkQueueWaitIdle(qvk.queue_graphics);
-
-	unsigned time_begin = Sys_Milliseconds();
+	uint64_t time_infer_begin = Sys_Nanoseconds();
+	nss.stall_ns = time_infer_begin - time_stall_begin;
 
 	if (dump) {
 		const float *in = (const float *)nss.input_mapped;
 		nss_dump_channels("pre_history", in, 0, nss.width, nss.height);
 		nss_dump_channels("pre_colour", in, 3, nss.width, nss.height);
+		// Several PNG writes; restart the clock so a dump frame does not land in
+		// the inference average.
+		time_infer_begin = Sys_Nanoseconds();
 	}
 
 	OrtValue *input_value = NULL, *kpn_value = NULL, *temporal_value = NULL;
+	uint64_t time_infer_end = 0;
 	bool ok = false;
 
 	if (!ort_ok(ort.api->CreateTensorWithDataAsOrtValue(ort.cpu_memory_info, nss.input_mapped,
@@ -974,6 +1042,9 @@ static VkResult nss_run_inference(void)
 			ort.api->ReleaseStatus(status);
 		} else {
 			ok = true;
+			// Stop the clock before the dump below, for the same reason as the
+			// pre-inference dump: PNG writes are not inference cost.
+			time_infer_end = Sys_Nanoseconds();
 			if (dump) {
 				// Not an RGB image -- channels 0/1/2 are theta/alpha/gamma blend
 				// params (see nss_reconstruct.comp's SampleTemporalParams), dumped
@@ -993,13 +1064,40 @@ done:
 
 	nss.tensor_valid = ok;
 
-	nss.inference_ms_accum += Sys_Milliseconds() - time_begin;
-	nss.inference_frames++;
-	if (nss.inference_frames >= UPSCALER_TIMING_INTERVAL) {
-		Com_Printf("upscaler: NSS %.2f ms/frame\n",
-			(double)nss.inference_ms_accum / nss.inference_frames);
-		nss.inference_ms_accum = 0;
-		nss.inference_frames = 0;
+	// A failed Run() never stamped the end, and its cost is not representative
+	// of a working frame anyway -- take the time up to here so the sample is
+	// still bounded rather than zero.
+	if (time_infer_end == 0)
+		time_infer_end = Sys_Nanoseconds();
+	nss.infer_ns = time_infer_end - time_infer_begin;
+
+	// Block average over the same window the GPU rows average over, so the two
+	// halves of the overlay settle at the same rate.
+	nss.stall_ns_accum += nss.stall_ns;
+	nss.infer_ns_accum += nss.infer_ns;
+	nss.timing_count++;
+
+	unsigned block = max(cvar_profiler_samples->integer, 1);
+	if (nss.timing_count >= block) {
+		nss.stall_avg_ms = (double)nss.stall_ns_accum / (nss.timing_count * 1e6);
+		nss.infer_avg_ms = (double)nss.infer_ns_accum / (nss.timing_count * 1e6);
+		nss.stall_ns_accum = 0;
+		nss.infer_ns_accum = 0;
+		nss.timing_count = 0;
+	}
+
+	nss.report_infer_ns_accum += nss.infer_ns;
+	nss.report_frames++;
+	if (nss.report_frames >= UPSCALER_TIMING_INTERVAL) {
+		// The overlay carries these numbers now; the console line stays for
+		// headless/benchmark runs, behind the same cvar as the rest of the
+		// upscaler's diagnostics.
+		if (cvar_flt_upscaler_verbose && cvar_flt_upscaler_verbose->integer) {
+			Com_Printf("upscaler: NSS %.2f ms/frame\n",
+				(double)nss.report_infer_ns_accum / (nss.report_frames * 1e6));
+		}
+		nss.report_infer_ns_accum = 0;
+		nss.report_frames = 0;
 	}
 
 	return VK_SUCCESS;
@@ -1024,11 +1122,25 @@ static void nss_record_reconstruct(VkCommandBuffer cmd_buf)
 	END_PERF_MARKER(cmd_buf, PROFILER_UPSCALER_UNPACK);
 }
 
+// Closes the PROFILER_UPSCALER span opened in nss_do(). Must run on every path
+// out of nss_final_blit(), including the one where inference failed -- an
+// orphaned start would otherwise pair with a stale slot.
+static void nss_close_timing(VkCommandBuffer cmd_buf)
+{
+	if (!nss.timing_open)
+		return;
+
+	nss.timing_open = false;
+	_VK(vkpt_profiler_query(cmd_buf, PROFILER_UPSCALER, PROFILER_STOP));
+}
+
 static VkResult nss_final_blit(VkCommandBuffer cmd_buf, bool warp)
 {
 	// A failed inference, or a frame where the pass never ran, leaves nothing
 	// valid to reconstruct from.
 	if (!nss.tensor_valid) {
+		nss_close_timing(cmd_buf);
+
 		bool needs_filter = qvk.extent_taa_output.width  != qvk.extent_unscaled.width
 		                 || qvk.extent_taa_output.height != qvk.extent_unscaled.height;
 		return vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output,
@@ -1036,6 +1148,7 @@ static VkResult nss_final_blit(VkCommandBuffer cmd_buf, bool warp)
 	}
 
 	nss_record_reconstruct(cmd_buf);
+	nss_close_timing(cmd_buf);
 
 	// vkpt_final_blit() stretches the written sub-rect to fill the actual
 	// display, same mechanism DRS uses elsewhere.
@@ -1098,6 +1211,12 @@ VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf)
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp)
 {
 	return VK_SUCCESS;
+}
+
+bool vkpt_upscaler_get_cpu_timings(double *stall_ms, double *stall_avg_ms,
+	double *infer_ms, double *infer_avg_ms)
+{
+	return false;
 }
 
 #endif // USE_ORT_QNN_UPSCALER
