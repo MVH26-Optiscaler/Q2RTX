@@ -284,6 +284,7 @@ SET(SRC_VKPT
 	refresh/vkpt/device_memory_allocator.c
 	refresh/vkpt/god_rays.c
 	refresh/vkpt/conversion.c
+	refresh/vkpt/upscaler.c
 )
 
 SET(HEADERS_VKPT
@@ -361,7 +362,10 @@ IF(IS_64_BIT)
         get_filename_component(shader_ext ${s} EXT)
         compile_shader(SOURCE_FILE ${s} OUTPUT_FILE_LIST shader_bytecode OUTPUT_FILE_NAME "${shader_name}.pipeline")
         if (shader_ext STREQUAL ".rgen")
-            compile_shader(SOURCE_FILE ${s} OUTPUT_FILE_LIST shader_bytecode OUTPUT_FILE_NAME "${shader_name}.query" DEFINES "-DKHR_RAY_QUERY" STAGE "comp")
+            # OPTIMIZE: these ray-query variants compile to one big compute
+            # shader each; unoptimized they exceed the Adreno shader compiler's
+            # size limit and vkCreateComputePipelines fails with VK_ERROR_UNKNOWN.
+            compile_shader(SOURCE_FILE ${s} OUTPUT_FILE_LIST shader_bytecode OUTPUT_FILE_NAME "${shader_name}.query" DEFINES "-DKHR_RAY_QUERY" STAGE "comp" OPTIMIZE)
         endif()
     endforeach()
 
@@ -504,7 +508,12 @@ IF (TARGET client)
         if (CONFIG_VKPT_ENABLE_IMAGE_DUMPS)
             TARGET_COMPILE_DEFINITIONS(client PRIVATE VKPT_IMAGE_DUMPS)
         ENDIF()
-        IF (WIN32)
+        IF (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64")
+        # The repo-root vulkan-1.lib is an x64 import lib; there's no official
+        # ARM64 Vulkan SDK loader lib vendored here, so use one generated from
+        # this system's own vulkan-1.dll exports (see arm64/README, if added).
+        TARGET_LINK_LIBRARIES(client ${CMAKE_SOURCE_DIR}/arm64/vulkan-1.lib)
+        ELSEIF (WIN32)
         TARGET_LINK_LIBRARIES(client vulkan-1)
         ELSE ()
         TARGET_LINK_LIBRARIES(client vulkan)
@@ -514,6 +523,15 @@ IF (TARGET client)
     TARGET_LINK_LIBRARIES(client stb)
     TARGET_LINK_LIBRARIES(client tinyobjloader)
     TARGET_LINK_LIBRARIES(client OpenAL)
+
+    IF(USE_ORT_QNN_UPSCALER)
+        TARGET_LINK_LIBRARIES(client onnxruntime_qnn)
+        TARGET_COMPILE_DEFINITIONS(client PRIVATE USE_ORT_QNN_UPSCALER=1)
+        ADD_CUSTOM_COMMAND(TARGET client POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ONNXRUNTIME_QNN_RUNTIME_DLLS} $<TARGET_FILE_DIR:client>
+            COMMENT "Copying ONNX Runtime QNN EP runtime DLLs next to client"
+        )
+    ENDIF()
 ENDIF()
 
 SOURCE_GROUP("game\\sources" FILES ${SRC_GAME})

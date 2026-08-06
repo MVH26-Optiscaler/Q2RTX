@@ -18,6 +18,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 
 #include "shared/shared.h"
+#ifdef _WIN32
+#include <malloc.h> // alloca() -- MSVC ARM64 needs this in scope for it to resolve as an intrinsic
+#endif
 #include "common/bsp.h"
 #include "common/cmd.h"
 #include "common/common.h"
@@ -175,6 +178,8 @@ VkptInit_t vkpt_initialization[] = {
 	{ "tonemap|", vkpt_tone_mapping_create_pipelines,  vkpt_tone_mapping_destroy_pipelines,  VKPT_INIT_RELOAD_SHADER,      0 },
 	{ "fsr",      vkpt_fsr_initialize,                 vkpt_fsr_destroy,                     VKPT_INIT_DEFAULT,            0 },
 	{ "fsr|",     vkpt_fsr_create_pipelines,           vkpt_fsr_destroy_pipelines,           VKPT_INIT_RELOAD_SHADER,      0 },
+	{ "upscaler",  vkpt_upscaler_initialize,           vkpt_upscaler_destroy,                VKPT_INIT_DEFAULT,            0 },
+	{ "upscaler|", vkpt_upscaler_create_pipelines,     vkpt_upscaler_destroy_pipelines,       VKPT_INIT_RELOAD_SHADER,      0 },
 
 	{ "physicalSky", vkpt_physical_sky_initialize,         vkpt_physical_sky_destroy,            VKPT_INIT_DEFAULT,        0 },
 	{ "physicalSky|", vkpt_physical_sky_create_pipelines,  vkpt_physical_sky_destroy_pipelines,  VKPT_INIT_RELOAD_SHADER,  0 },
@@ -231,8 +236,29 @@ static inline bool extents_equal(VkExtent2D a, VkExtent2D b)
 	return a.width == b.width && a.height == b.height;
 }
 
+static bool is_accumulation_rendering_active(void);
+
+// Whether the NPU upscaler runs this frame. It picks the render extent when it
+// does (see get_render_extent() below), and several passes need to agree on
+// whether it is in the frame graph. Accumulation ("photo") mode renders at full
+// resolution over many frames for quality and reconstructs nothing spatially, so
+// it wins.
+static bool upscaler_active_this_frame(void)
+{
+	return vkpt_upscaler_get_scale() > 1 && !is_accumulation_rendering_active();
+}
+
 static VkExtent2D get_render_extent(void)
 {
+	// The NPU upscaler owns its own resolution policy: by default it renders at
+	// display/scale, the one extent whose output lands exactly on the display, and
+	// flt_upscaler_render_scale can override that with a percentage of the display
+	// extent (100 = render at display resolution and downsample the model's
+	// output). Either way it is derived from the display extent, so viewsize has no
+	// effect while the upscaler is active. See vkpt_upscaler_get_render_extent().
+	if (upscaler_active_this_frame())
+		return vkpt_upscaler_get_render_extent(qvk.extent_unscaled);
+
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -260,12 +286,31 @@ static VkExtent2D get_render_extent(void)
 static VkExtent2D get_screen_image_extent(void)
 {
 	VkExtent2D result;
+
+	// The NPU upscaler is the only path whose final image is produced outside the
+	// screen images entirely -- it owns its own output image, and
+	// evaluate_taa_settings() pins extent_taa_output to the render extent. So
+	// nothing downstream of the path tracer needs display-sized storage, and
+	// allocating all ~68 screen images at the display extent (which is what the
+	// max() below otherwise does) would keep four times the working set resident
+	// at 2x, sixteen times at 4x. The bytes moved per frame are unchanged; what
+	// improves is how much of it stays in the system cache.
+	//
+	// DRS is refused outright while the upscaler is on, so this needs no
+	// interaction with the branch below.
+	if (upscaler_active_this_frame())
+	{
+		result = qvk.extent_render;
+		result.width = (result.width + 1) & ~1;
+		return result;
+	}
+
 	if (cvar_drs_enable->integer)
 	{
 		int image_scale = max(cvar_drs_minscale->integer, cvar_drs_maxscale->integer);
 
-		// In case FSR enable we'll always upscale to 100% and thus need at least the unscaled extent
-		if(vkpt_fsr_is_enabled())
+		// FSR and the NPU upscaler always upscale to 100% and thus need at least the unscaled extent
+		if(vkpt_fsr_is_enabled() || vkpt_upscaler_is_enabled())
 			image_scale = max(image_scale, 100);
 
 		result.width = (uint32_t)(qvk.extent_unscaled.width * (float)image_scale / 100.f);
@@ -295,8 +340,20 @@ vkpt_initialize_all(VkptInitFlags_t init_flags)
 	qvk.extent_render = get_render_extent();
 	qvk.extent_screen_images = get_screen_image_extent();
 
-	qvk.extent_taa_images.width = max(qvk.extent_screen_images.width, qvk.extent_unscaled.width);
-	qvk.extent_taa_images.height = max(qvk.extent_screen_images.height, qvk.extent_unscaled.height);
+	// TAA_OUTPUT and ASVGF_TAA normally have to reach the display extent because
+	// TAAU resolves into them. Under the NPU upscaler they do not: it pins
+	// extent_taa_output to the render extent and its own output image carries the
+	// frame the rest of the way, so sizing these to the display would allocate
+	// three quarters of them (at 2x) to never be touched.
+	if (upscaler_active_this_frame())
+	{
+		qvk.extent_taa_images = qvk.extent_screen_images;
+	}
+	else
+	{
+		qvk.extent_taa_images.width = max(qvk.extent_screen_images.width, qvk.extent_unscaled.width);
+		qvk.extent_taa_images.height = max(qvk.extent_screen_images.height, qvk.extent_unscaled.height);
+	}
 
 	qvk.gpu_slice_width = (qvk.extent_render.width + qvk.device_count - 1) / qvk.device_count;
 
@@ -2631,6 +2688,7 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 		return;
 
 	int flt_taa = cvar_flt_taa->integer;
+
 	// FSR RCAS needs upscaled input; if EASU was disabled, force to TAAU
 	bool force_upscaling = vkpt_fsr_is_enabled() && vkpt_fsr_needs_upscale();
 	if(force_upscaling)
@@ -2644,6 +2702,9 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 	}
 	else if (flt_taa == AA_MODE_UPSCALE) // TAAU or TAA+FSR
 	{
+		// Dropping to plain TAA here is for the case TAAU cannot serve, where the
+		// render extent already meets or exceeds the display so there is nothing
+		// to upsample.
 		if (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height)
 		{
 			qvk.effective_aa_mode = AA_MODE_TAA;
@@ -2655,6 +2716,14 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 				qvk.extent_taa_output = qvk.extent_unscaled;
 		}
 	}
+
+	// The NPU upscaler copies the TAA output into its input tensor 1:1, so
+	// nothing upstream may upsample first: its ONNX Runtime session is built for
+	// exactly extent_taa_output, and every extent change costs a session rebuild.
+	// Unconditional and last: it has to hold whatever flt_taa says, and even if
+	// FSR was also switched on behind flt_upscaling's back.
+	if (upscaler_active_this_frame())
+		qvk.extent_taa_output = qvk.extent_render;
 }
 
 static void
@@ -2852,11 +2921,30 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
 			ubo->pt_ndf_trim = 1.f;
 		}
 	}
+	else if(upscaler_active_this_frame())
+	{
+		// No LOD bias on the NPU upscaler path. The negative bias below exists to
+		// feed temporal reconstruction: TAAU renders low and resolves the extra
+		// texture detail into the display-resolution history over several frames.
+		// There is no such accumulation here -- evaluate_taa_settings() pins
+		// extent_taa_output to extent_render for exactly this mode, so TAAU runs
+		// 1:1 and the upscaling is entirely spatial. Biasing the mips sharper than
+		// the render extent can carry would only hand the model aliasing it cannot
+		// undo, which it turns into ringing. It reconstructs better from a
+		// band-limited frame.
+		//
+		// This holds across the whole viewsize range now that it selects the render
+		// extent here too: below 100% the argument above applies directly, and at or
+		// above it the frame is already supersampled, which is the branch below's
+		// clamp of resolution_scale to 1 -- the same answer by a longer route.
+		ubo->pt_texture_lod_bias = cvar_pt_texture_lod_bias->value;
+	}
 	else if(fsr_enabled || (qvk.effective_aa_mode == AA_MODE_UPSCALE))
 	{
-		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100
-		float resolution_scale = (drs_effective_scale != 0) ? (float)drs_effective_scale : (float)scr_viewsize->integer;
-		resolution_scale *= 0.01f;
+		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100.
+		// Taken from the extents that were actually used rather than from viewsize; for these
+		// paths the two are the same value.
+		float resolution_scale = (float)qvk.extent_render.width / (float)qvk.extent_unscaled.width;
 		resolution_scale = Q_clipf(resolution_scale, 0.1f, 1.f);
 		ubo->pt_texture_lod_bias = cvar_pt_texture_lod_bias->value + log2f(resolution_scale);
 	}
@@ -3310,8 +3398,13 @@ R_RenderFrame_RTX(refdef_t *fd)
 		}
 		END_PERF_MARKER(post_cmd_buf, PROFILER_TONE_MAPPING);
 
-		// Skip FSR (upscaling) if image is going to be heavily blurred anyway (menu mode)
-		if(vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
+		// Skip FSR/NPU upscaling if image is going to be heavily blurred anyway (menu mode).
+		// The two are mutually exclusive alternatives for the same upscale-to-display-res step.
+		if (upscaler_active_this_frame() && !qvk.frame_menu_mode)
+		{
+			vkpt_upscaler_do(post_cmd_buf);
+		}
+		else if(vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
 		{
 			vkpt_fsr_do(post_cmd_buf);
 		}
@@ -3323,7 +3416,12 @@ R_RenderFrame_RTX(refdef_t *fd)
 
 		_VK(vkpt_profiler_query(post_cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
 
-		vkpt_submit_command_buffer_simple(post_cmd_buf, qvk.queue_graphics, true);
+		// Signals the NPU upscaler's download fence when the transfer above went
+		// into this command buffer, so next frame's inference can tell the tensor
+		// is ready without draining the queue. VK_NULL_HANDLE otherwise, which is
+		// exactly what vkpt_submit_command_buffer_simple() would pass.
+		vkpt_submit_command_buffer(post_cmd_buf, qvk.queue_graphics, (1 << qvk.device_count) - 1,
+			0, NULL, NULL, NULL, 0, NULL, NULL, vkpt_upscaler_download_fence());
 	}
 
 	temporal_frame_valid = ref_mode.enable_denoiser;
@@ -3505,13 +3603,32 @@ R_BeginFrame_RTX(void)
 	}
 
 	drs_process();
-	if (vkpt_refdef.fd)
+
+	VkExtent2D extent_render = get_render_extent();
+
+	// Toggling the NPU upscaler changes the render extent by the model's whole
+	// scale factor in one frame, which DRS never does. The tone curve and the
+	// adapted luminance live in the persistent qvk.buf_tonemap and blend towards
+	// the new frame over tm_exposure_speed_* seconds, so a histogram gathered
+	// over the old rect would otherwise drive the exposure for a visible while
+	// after the switch. Reset rather than adapt.
+	if (!extents_equal(extent_render, qvk.extent_render))
 	{
-		vkpt_refdef.fd->feedback.resolution_scale = (drs_effective_scale != 0) ? drs_effective_scale : scr_viewsize->integer;
+		vkpt_tone_mapping_request_reset();
+		vkpt_reset_accumulation();
 	}
 
-	qvk.extent_render = get_render_extent();
+	qvk.extent_render = extent_render;
 	qvk.gpu_slice_width = (qvk.extent_render.width + qvk.device_count - 1) / qvk.device_count;
+
+	if (vkpt_refdef.fd && qvk.extent_unscaled.width)
+	{
+		// Report the scale that was actually rendered at rather than the one that
+		// was asked for; the NPU upscaler overrides both viewsize and DRS, and
+		// this is what scr_fps and cl_resolution_scale show the user.
+		vkpt_refdef.fd->feedback.resolution_scale =
+			qvk.extent_render.width * 100 / qvk.extent_unscaled.width;
+	}
 	
 	VkExtent2D extent_screen_images = get_screen_image_extent();
 
@@ -3596,34 +3713,75 @@ R_EndFrame_RTX(void)
 
 	VkCommandBuffer cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
 
-	if (frame_ready)
+	bool upscaler_blits_this_frame = frame_ready && upscaler_active_this_frame() && !qvk.frame_menu_mode;
+
+	// The NPU upscaler's round trip spans two frames, and its upload lives in the
+	// blit below. On any frame that does not reach that blit nothing will consume
+	// what it downloaded, so drop it: a tensor left pending would otherwise
+	// resurface a frame late, possibly after its staging buffers were rebuilt at
+	// a different extent.
+	if (!upscaler_blits_this_frame)
+		vkpt_upscaler_discard();
+
+	// The NPU upscaler's upload is a buffer-to-image copy, which cannot be
+	// recorded inside a render pass, so it goes before the pass is opened. The
+	// blit it feeds is a draw inside it.
+	if (frame_ready && upscaler_blits_this_frame)
+		vkpt_upscaler_record_upload(cmd_buf);
+
+	// The final blit and the HUD both target the swapchain. They used to open a
+	// render pass each, which on a tiler is two full load/store cycles over the
+	// whole image; one pass with both draws makes it one store.
+	bool draw_hud = vkpt_draw_have_stretch_pics();
+
+	if (frame_ready || draw_hud)
 	{
-		bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
-		if (vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
-		{
-			vkpt_fsr_final_blit(cmd_buf, waterwarp);
-		}
-		else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
-		{
-			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
-		}
-		else
-		{
-			VkExtent2D extent_unscaled_half;
-			extent_unscaled_half.width = qvk.extent_unscaled.width / 2;
-			extent_unscaled_half.height = qvk.extent_unscaled.height / 2;
+		// The blit's quad covers the entire render area, so when it runs there is
+		// nothing worth loading into tile memory. Without it the HUD composites
+		// onto whatever is already in the swapchain image and the load is real.
+		vkpt_draw_begin_swapchain_pass(cmd_buf, frame_ready);
 
-			if (extents_equal(qvk.extent_render, qvk.extent_unscaled) ||
-				(extents_equal(qvk.extent_render, extent_unscaled_half) && drs_effective_scale == 0)) // don't do nearest filter 2x upscale with DRS enabled
-				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
+		if (frame_ready)
+		{
+			bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
+			if (upscaler_blits_this_frame)
+			{
+				vkpt_upscaler_final_blit(cmd_buf, waterwarp);
+			}
+			else if (vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
+			{
+				vkpt_fsr_final_blit(cmd_buf, waterwarp);
+			}
+			else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
+			{
+				// TAAU normally lands this at display resolution, so an unfiltered
+				// blit is a 1:1 copy. It does not when the NPU upscaler has pinned
+				// extent_taa_output to the render extent and then sits out the frame
+				// (menu mode), which would otherwise leave a nearest-neighbour
+				// upscale of the render-resolution image.
+				bool needs_filter = !extents_equal(qvk.extent_taa_output, qvk.extent_unscaled);
+				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, needs_filter, waterwarp);
+			}
 			else
-				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, true, waterwarp);
+			{
+				VkExtent2D extent_unscaled_half;
+				extent_unscaled_half.width = qvk.extent_unscaled.width / 2;
+				extent_unscaled_half.height = qvk.extent_unscaled.height / 2;
+
+				if (extents_equal(qvk.extent_render, qvk.extent_unscaled) ||
+					(extents_equal(qvk.extent_render, extent_unscaled_half) && drs_effective_scale == 0)) // don't do nearest filter 2x upscale with DRS enabled
+					vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
+				else
+					vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, true, waterwarp);
+			}
+
+			frame_ready = false;
 		}
 
-		frame_ready = false;
-	}
+		vkpt_draw_submit_stretch_pics(cmd_buf);
 
-	vkpt_draw_submit_stretch_pics(cmd_buf);
+		vkpt_draw_end_swapchain_pass(cmd_buf);
+	}
 
 	VkSemaphore wait_semaphores[] = { qvk.semaphores[qvk.current_frame_index][0].image_available };
 	VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
@@ -3853,6 +4011,8 @@ R_Init_RTX(bool total)
 
 	drs_init();
 	vkpt_fsr_init_cvars();
+	// vkpt_upscaler_init_cvars() is deliberately not here next to the other two:
+	// it hooks flt_taa, which the UBO_CVAR_LIST block below is what registers.
 
 	// Minimum NVIDIA driver version - this is a cvar in case something changes in the future,
 	// and the current test no longer works.
@@ -3883,6 +4043,10 @@ R_Init_RTX(bool total)
 #define UBO_CVAR_DO(name, default_value) cvar_##name = Cvar_Get(#name, #default_value, 0);
 	UBO_CVAR_LIST
 #undef UBO_CVAR_LIST
+
+	// Needs cvar_flt_taa (registered just above) and cvar_flt_fsr_enable (from
+	// vkpt_fsr_init_cvars, further up), because it multiplexes both.
+	vkpt_upscaler_init_cvars();
 
 	cvar_flt_temporal_hf->changed = temporal_cvar_changed;
 	cvar_flt_temporal_lf->changed = temporal_cvar_changed;

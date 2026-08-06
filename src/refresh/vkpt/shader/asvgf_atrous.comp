@@ -99,7 +99,7 @@ filter_image(
 	}
 
 	// reduce the HF filter sensitivity to normals when the lighting is invalidated
-	float normal_weight_scale = clamp(hist_len_hf / 8, 0, 1);
+	MP float normal_weight_scale = clamp(hist_len_hf / 8, 0, 1);
 
 	float normal_weight_hf = global_ubo.flt_atrous_normal_hf;
 	normal_weight_hf *= normal_weight_scale;
@@ -135,7 +135,7 @@ filter_image(
 	    jitter = ivec2((vec2(jitter_x, jitter_y) - 0.5) * float(step_size));
 	}
 
-	float spec_filter_width_scale = clamp(roughness_center * 30 - spec_iteration, 0, 1);
+	MP float spec_filter_width_scale = clamp(roughness_center * 30 - spec_iteration, 0, 1);
 
 	// Compute the weighted average of color and moments from a sparse 3x3 pattern around the target pixel
 	const int r = 1;
@@ -152,9 +152,12 @@ filter_image(
 			vec3 normal = decode_normal(texelFetch(TEX_PT_NORMAL_A, p, 0).x);
 
 			float depth = texelFetch(TEX_PT_VIEW_DEPTH_A, p, 0).x;
-			float roughness = texelFetch(TEX_PT_METALLIC_A, p, 0).y;
+			// R8G8_UNORM source: 1/255 quantized, far coarser than fp16 in [0,1].
+			MP float roughness = texelFetch(TEX_PT_METALLIC_A, p, 0).y;
 
-			float dist_z = abs(depth_center - depth) * fwidth_depth * global_ubo.flt_atrous_depth;
+			// Only ever consumed through exp(-dist_z), which saturates to 0 for
+			// large values -- the same answer fp32 gives.
+			MP float dist_z = abs(depth_center - depth) * fwidth_depth * global_ubo.flt_atrous_depth;
 			w *= exp(-dist_z / float(step_size));
 			w *= wavelet_kernel[abs(xx)][abs(yy)];
 
@@ -213,6 +216,9 @@ SH interpolate_lf(sampler2D img_lf_shY, sampler2D img_lf_CoCg, ivec2 ipos)
 	vec3 geo_normal_center = decode_normal(texelFetch(TEX_PT_GEO_NORMAL_A, ipos, 0).x);
 
 
+	// pos_lowres / pos_ld / subpix stay full precision. ipos.x/3 reaches 1280 at
+	// 4K, where the fp16 ulp is 1.0 -- subpix would come out identically zero and
+	// the four bilinear taps below would collapse to a single nearest-neighbour tap.
 	vec2 pos_lowres = (vec2(ipos) + vec2(0.5)) / GRAD_DWN - vec2(0.5);
 	vec2 pos_ld = floor(pos_lowres);
 	vec2 subpix = fract(pos_lowres - pos_ld);
@@ -220,9 +226,10 @@ SH interpolate_lf(sampler2D img_lf_shY, sampler2D img_lf_CoCg, ivec2 ipos)
 	SH sum_lf = init_SH();
 	float sum_w = 0;
 
-	// 4 bilinear taps
+	// 4 bilinear taps. The weights are products of [0,1] terms, computed from the
+	// full-precision subpix above, so only the product is relaxed.
 	const ivec2 off[4] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
-	float w[4] = {
+	MP float w[4] = {
 		(1.0 - subpix.x) * (1.0 - subpix.y),
 		(subpix.x      ) * (1.0 - subpix.y),
 		(1.0 - subpix.x) * (subpix.y      ),
@@ -238,10 +245,10 @@ SH interpolate_lf(sampler2D img_lf_shY, sampler2D img_lf_CoCg, ivec2 ipos)
 		vec3 p_geo_normal = decode_normal(texelFetch(TEX_PT_GEO_NORMAL_A, p_hires, 0).x);
 
 		// Start with bilinear weight
-		float p_w = w[i];
+		MP float p_w = w[i];
 
 		// Compute depth and normal similarity between the target pixel and the low-res anchor pixel
-		float dist_depth = abs(p_depth - depth_center) * fwidth_depth;
+		MP float dist_depth = abs(p_depth - depth_center) * fwidth_depth;
 		p_w *= exp(-dist_depth);
 		p_w *= pow(max(0.0, dot(geo_normal_center, p_geo_normal)), 8);
 

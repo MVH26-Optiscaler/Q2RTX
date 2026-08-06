@@ -736,7 +736,13 @@ Red channel shows low-frequency (GI) gradients, green channel shows direct diffu
 and blue channel shows direct specular gradients. Default value is 0.
 
 #### `flt_taa`
-Enables temporal anti-aliasing and primary ray direction jitter. Default value is 1.
+Selects the temporal anti-aliasing / reconstruction mode, and with it primary ray
+direction jitter. Default value is 2.
+| Value | Mode                                                        |
+| ----- | ----------------------------------------------------------- |
+| 0     | none                                                         |
+| 1     | temporal AA                                                  |
+| 2     | temporal upscaling (TAAU)                                    |
 
 #### `flt_fsr_enable`
 Enables FidelityFX Super Resolution 1.0 ("AMD FSR 1.0") upscaling. Default value is 0.
@@ -760,6 +766,64 @@ Range is from 0.0 to 2.0, with lower meaning sharper.
 #### `flt_fsr_easu`, `flt_fsr_rcas`
 Individual control of the upscaling and sharpening steps of FSR. Both default to 1.
 Intended for testing purposes.
+
+#### `flt_upscaling`
+Selects the upscaler shown in the video settings menu. The upscalers are mutually
+exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable` for you.
+Default value is 0.
+| Value | Upscaler            |
+| ----- | ------------------- |
+| 0     | none                |
+| 1     | AMD FSR 1.0         |
+| 2     | QuickSRNet Large 2x |
+| 3     | QuickSRNet Large 4x |
+
+A QuickSRNet model's scale factor is a property of the model, not a resolution policy:
+`viewsize` and the dynamic resolution scaling cvars choose the render extent exactly as
+they do for every other path, and the model then multiplies it by its fixed factor.
+Whatever that overshoots the display by is removed by filtering on the final blit.
+
+So the downsample ratio is `viewsize * scale / 100`. `viewsize 25` with the 4x model and
+`viewsize 50` with the 2x model land on the display exactly (480x270 and 960x540 at
+1080p) and no resampling happens — the cheap upscale-for-performance case. Above that the
+extra resolution is real supersampling, and at `viewsize 100` the path tracer renders at
+native resolution and the frame is downsampled by the model's factor. That is high
+quality and far too slow for gameplay: the model runs over the whole frame, so its cost
+grows with the square of `viewsize`.
+
+#### `flt_upscaler_enable`
+Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNet Large 2x and
+2 is QuickSRNet Large 4x. Both are QuickSRNet Large fine-tuned on Quake II RTX frames,
+which trades generality for sharper results on this game's content. Default value is 0.
+Normally driven by `flt_upscaling` rather than set directly.
+
+The whole frame is one inference — there is no tiling. Models must declare uint8 NHWC
+RGBA input and output (`[1, H, W, 4]`) with free height and width, because the frame is
+copied into the input tensor and back out of the output tensor with no shader in between.
+An NCHW model would run and render horizontal colour bands, so it is rejected at load
+time instead; `scripts/onnx-nhwc-io.py` converts one.
+
+Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon). The
+models themselves ship in `baseq2/models`. If a model file is missing or the QNN
+execution provider is unavailable, the upscaler stays off and says so on the console;
+`scripts/deploy-assets.ps1 -VerifyOnly` reports which models are actually present.
+
+##### Resolution changes are expensive
+The Hexagon NPU wants a static graph, so the render extent is pinned into the ONNX
+Runtime session when it is created. Changing `viewsize`, the window size or the display
+resolution therefore rebuilds the session, which stalls for a few seconds while the QNN
+execution provider finalizes the model for the NPU. So does changing `flt_upscaling`.
+
+Dynamic render scaling moves the render extent every frame, so it cannot be served at
+any useful rate. With `drs_enable 1` the NPU upscaler switches itself off and says so on
+the console rather than stalling repeatedly; set `drs_enable 0` and a fixed `viewsize`,
+then select the upscaler again.
+
+#### `flt_upscaler_verbose`
+Raises ONNX Runtime logging to verbose, which is where the per-node execution-provider
+assignment is reported — the authoritative way to confirm inference really dispatches
+to the NPU rather than falling back to the CPU. Far too chatty for normal play.
+Default value is 0.
 
 #### `gr_enable`
 Enables the god rays (volumetric lighting) effect. Default value is 1.

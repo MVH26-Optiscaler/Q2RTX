@@ -21,6 +21,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #define _GLSL_UTILS_GLSL
 
 #include "constants.h"
+#include "precision.glsl"
 
 #ifndef M_PI
 #define M_PI 3.1415926535897932384626433832795

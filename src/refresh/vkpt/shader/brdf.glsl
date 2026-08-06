@@ -16,6 +16,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 */
 
+#include "precision.glsl"
+
 float square(float x) { return x * x; }
 
 // Converts a square of roughness to a Phong specular power
@@ -42,9 +44,12 @@ float G_Smith_over_4_NdotV(float roughness, float NdotV, float NdotL)
     return g1 * g2;
 }
 
-vec3 schlick_fresnel(vec3 F0, float HdotV, float specular_factor)
+// F0 is base_reflectivity in [0,1], HdotV is a dot product in [0,1], and
+// specular_factor arrives from the material table already as a half. The result
+// is explicitly clamped to [0,1]. Nothing here leaves fp16 range.
+MP vec3 schlick_fresnel(MP vec3 F0, MP float HdotV, MP float specular_factor)
 {
-    vec3 F = F0 + (vec3(1.0) - F0) * pow(1 - HdotV, 5);
+    MP vec3 F = F0 + (vec3(1.0) - F0) * pow(1 - HdotV, 5);
     F *= specular_factor;
     F = clamp(F, vec3(0.0), vec3(1.0));
     return F;
@@ -121,9 +126,12 @@ float phong(vec3 N, vec3 L, vec3 V, float phong_exp)
     return pow(max(0.0, dot(H, N)), phong_exp);
 }
 
-void get_reflectivity(vec3 base_color, float metallic, out vec3 o_albedo, out vec3 o_base_reflectivity)
+// base_color is clamped to [0,1] by the caller (path_tracer_rgen.h) and metallic
+// comes out of an R8G8_UNORM image, so both outputs are convex combinations
+// inside [0,1].
+void get_reflectivity(MP vec3 base_color, MP float metallic, out MP vec3 o_albedo, out MP vec3 o_base_reflectivity)
 {
-    const float dielectric_specular = 0.04;
+    const MP float dielectric_specular = 0.04;
     o_albedo = mix(base_color * (1.0 - dielectric_specular), vec3(0), metallic);
     o_base_reflectivity = mix(vec3(dielectric_specular), base_color, metallic);
 }

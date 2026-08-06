@@ -109,14 +109,17 @@ vec4 show_bar_chart(ivec2 pos, bool is_curve)
 
 // Applies blue-noise-based dithering for linear -> sRGB conversion.
 // This prevents onscreen banding artifacts in areas with subtle gradients.
-vec3 srgb_dither(vec3 color, ivec2 ipos)
+// Only reached on the SDR path, after mapped_color has been clamped to [0,1],
+// so every value in here is display-range. diff is ~1/256 scaled by the sRGB
+// derivative; fp16 resolves that to ~0.2% of the dither amplitude.
+MP vec3 srgb_dither(MP vec3 color, ivec2 ipos)
 {
-    vec3 srgb = linear_to_srgb(color);
-    vec3 diff = srgb_to_linear(srgb + vec3(1.0/256.0)) - color;
+    MP vec3 srgb = linear_to_srgb(color);
+    MP vec3 diff = srgb_to_linear(srgb + vec3(1.0/256.0)) - color;
 
     int texnum = global_ubo.current_frame_idx & (NUM_BLUE_NOISE_TEX - 1);
     ivec2 texpos = ipos & ivec2(BLUE_NOISE_RES - 1);
-    float noise = texelFetch(TEX_BLUE_NOISE, ivec3(texpos, texnum), 0).r;
+    MP float noise = texelFetch(TEX_BLUE_NOISE, ivec3(texpos, texnum), 0).r;
 
     color = color + diff * (noise - 0.5) * 2;
     return max(vec3(0), color);
@@ -133,6 +136,13 @@ void main()
     // Get input color and luminance.
     vec3 input_color = imageLoad(IMG_TAA_OUTPUT, ipos).rgb;
     input_color /= STORAGE_SCALE_HDR;
+
+    // A NaN or Inf reaching here survives every operation below and lands on the
+    // swapchain as a white pixel, and the same texel feeds next frame's exposure
+    // through the histogram. bloom_blur.comp and bloom_composite.comp already
+    // reject these; this pass did not.
+    if(any(isnan(input_color)) || any(isinf(input_color)))
+        input_color = vec3(0);
 
     /* Apply a "colorization" effect.
      * fs_colorize.rgb is the color, fs_colorize.a is the strength
@@ -188,7 +198,14 @@ void main()
 
     // Original autoexposure tonemapping application code
     // Exposure adjustment followed by Reinhard tonemapper
-    const float adapted_luminance = tonemap_buffer.adapted_luminance;
+    // Written by tone_mapping_curve.comp, which clamps it to
+    // [tm_min_luminance, tm_max_luminance]. Guard anyway: this is a divisor, and
+    // the negated comparison also catches NaN, matching what the CPU side does
+    // with prev_adapted_luminance in R_RenderFrame_RTX.
+    float adapted_luminance = tonemap_buffer.adapted_luminance;
+    if(!(adapted_luminance > 0.0))
+        adapted_luminance = 0.005;
+
     const float scaled_luminance = exp2(global_ubo.tm_exposure_bias - 2) * lum / adapted_luminance;
     // HDR: Adjust white point upward for large brightness
     const float white_point = (spec_tone_mapping_hdr != 0) ? max(global_ubo.tm_white_point, global_ubo.tm_hdr_peak_nits / 80) : global_ubo.tm_white_point;

@@ -24,6 +24,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier    : enable
 
+// global_textures.h declares the material samplers with a precision qualifier,
+// which makes glslang warn about unstated defaults in fragment shaders. These
+// match the profile's existing behaviour.
+precision highp float;
+precision highp int;
+
 #define GLOBAL_UBO_DESC_SET_IDX 0
 #include "global_ubo.h"
 

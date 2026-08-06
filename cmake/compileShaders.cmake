@@ -13,6 +13,7 @@ set(SHADER_SOURCE_DEPENDENCIES
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/path_tracer.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/path_tracer_hit_shaders.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/path_tracer_transparency.glsl
+    ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/precision.glsl
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/precomputed_sky.glsl
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/precomputed_sky_params.h
     ${CMAKE_SOURCE_DIR}/src/refresh/vkpt/shader/projection.glsl
@@ -37,6 +38,33 @@ else()
     message(STATUS "Using this glslang: ${GLSLANG_COMPILER}")
 endif()
 
+# spirv-opt, used to shrink the ray-query compute variants of the path tracer
+# shaders (see the OPTIMIZE option of compile_shader below). The bundled
+# glslang is built with ENABLE_OPT=OFF -- it advertises -Os but errors out with
+# "optimizer not linked" -- so we shell out to a standalone spirv-opt instead.
+OPTION(USE_SPIRV_OPT "Run spirv-opt -Os on shaders that request it (needed for ray-query on Adreno)" ON)
+
+if(USE_SPIRV_OPT)
+    # VULKAN_SDK isn't always exported, so also probe the default install root.
+    file(GLOB VULKAN_SDK_BIN_DIRS "C:/VulkanSDK/*/Bin")
+    find_program(SPIRV_OPT_COMMAND NAMES spirv-opt
+        HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" ${VULKAN_SDK_BIN_DIRS})
+
+    if(SPIRV_OPT_COMMAND)
+        message(STATUS "Using this spirv-opt: ${SPIRV_OPT_COMMAND}")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+        # Adreno's compute-shader compiler rejects the unoptimized path tracer
+        # shaders outright (vkCreateComputePipelines -> VK_ERROR_UNKNOWN), so on
+        # ARM64 this isn't merely an optimization -- the build won't run.
+        message(WARNING "spirv-opt not found. On Adreno/ARM64 the unoptimized ray-query "
+            "path tracer shaders exceed the driver's shader compiler limits and the game "
+            "will fail with 'Couldn't initialize pt'. Install the Vulkan SDK or set "
+            "SPIRV_OPT_COMMAND.")
+    else()
+        message(STATUS "spirv-opt not found, shaders will not be size-optimized.")
+    endif()
+endif()
+
 # Collect additional glslangValidator args
 set(GLSLANG_ARGS)
 if(CONFIG_BUILD_SHADER_DEBUG_INFO)
@@ -45,10 +73,10 @@ endif()
 
 # Write args to a file. Used to trigger rebuild if they change
 set(COMPILE_ARGS_DEP "${CMAKE_BINARY_DIR}/compile_shader.dep")
-file(CONFIGURE OUTPUT "${COMPILE_ARGS_DEP}" CONTENT "@GLSLANG_ARGS@")
+file(CONFIGURE OUTPUT "${COMPILE_ARGS_DEP}" CONTENT "@GLSLANG_ARGS@:@SPIRV_OPT_COMMAND@")
 
 function(compile_shader)
-    set(options "")
+    set(options OPTIMIZE)
     set(oneValueArgs SOURCE_FILE OUTPUT_FILE_NAME OUTPUT_FILE_LIST STAGE)
     set(multiValueArgs DEFINES INCLUDES)
     cmake_parse_arguments(params "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -92,13 +120,23 @@ function(compile_shader)
             "${src_file}"
             -o "${out_file}")
 
+    # Optional in-place size optimization. Shrinks the path tracer's ray-query
+    # compute variants by 35-55%, which is what keeps them under the Adreno
+    # shader compiler's (undocumented) size limit -- without it those pipelines
+    # fail to create with VK_ERROR_UNKNOWN. Harmless elsewhere.
+    set(optimize_command)
+    if (params_OPTIMIZE AND SPIRV_OPT_COMMAND)
+        set(optimize_command COMMAND ${SPIRV_OPT_COMMAND} -Os "${out_file}" -o "${out_file}")
+    endif()
+
     add_custom_command(OUTPUT ${out_file}
                        DEPENDS ${src_file}
                        DEPENDS ${SHADER_SOURCE_DEPENDENCIES}
                        DEPENDS ${COMPILE_ARGS_DEP}
                        MAIN_DEPENDENCY ${src_file}
                        COMMAND ${CMAKE_COMMAND} -E make_directory ${out_dir}
-                       COMMAND ${GLSLANG_COMPILER} ${glslang_command_line})
-    
+                       COMMAND ${GLSLANG_COMPILER} ${glslang_command_line}
+                       ${optimize_command})
+
     set(${params_OUTPUT_FILE_LIST} ${${params_OUTPUT_FILE_LIST}} ${out_file} PARENT_SCOPE)
 endfunction()

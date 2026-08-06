@@ -154,25 +154,31 @@ END_SHADER_STRUCT( SunColorBuffer )
 
 #ifdef VKPT_SHADER
 
+#include "precision.glsl"
+
 #ifdef VERTEX_READONLY
 #define VERTEX_READONLY_FLAG readonly
 #else
 #define VERTEX_READONLY_FLAG
 #endif
 
+// Every float here is unpackHalf2x16'd out of light_buffer.material_table in
+// get_material_info(), so these are already fp16 values on the wire that were
+// only being widened into registers. light_style_scale multiplies emissive_factor
+// and stays within a small range.
 struct MaterialInfo
 {
 	uint base_texture;
 	uint normals_texture;
 	uint emissive_texture;
 	uint mask_texture;
-	float bump_scale;
-	float roughness_override;
-	float metalness_factor;
-	float emissive_factor;
-	float specular_factor;
-	float base_factor;
-	float light_style_scale;
+	MP float bump_scale;
+	MP float roughness_override;
+	MP float metalness_factor;
+	MP float emissive_factor;
+	MP float specular_factor;
+	MP float base_factor;
+	MP float light_style_scale;
 	uint num_frames;
 	uint next_frame;
 };

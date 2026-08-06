@@ -44,12 +44,19 @@ layout(local_size_x = GROUP_SIZE, local_size_y = GROUP_SIZE, local_size_z = 1) i
 #define GLOBAL_TEXTURES_DESC_SET_IDX 1
 #include "global_textures.h"
 
-// Store some color data in shared memory for efficient access and for downsampling
+#include "precision.glsl"
+
+// Store some color data in shared memory for efficient access and for downsampling.
+// s_normal_lum is already packed to halves via packHalf4x16. The other four mirror
+// r16f / rgba16f / rg16f images, so relaxing them cannot lose anything the texture
+// fetch had not already quantized away.
+// NOTE: mediump here relaxes the arithmetic, not the allocation -- SPIR-V still
+// reserves 32 bits per element. Shrinking the block needs explicit float16_t.
 shared uvec2 s_normal_lum[SHARED_SIZE][SHARED_SIZE];
-shared float s_depth[SHARED_SIZE][SHARED_SIZE];
-shared vec4 s_lf_shy[GROUP_SIZE][GROUP_SIZE];
-shared vec2 s_lf_cocg[GROUP_SIZE][GROUP_SIZE];
-shared float s_depth_width[GROUP_SIZE/GRAD_DWN][GROUP_SIZE/GRAD_DWN];
+shared MP float s_depth[SHARED_SIZE][SHARED_SIZE];
+shared MP vec4 s_lf_shy[GROUP_SIZE][GROUP_SIZE];
+shared MP vec2 s_lf_cocg[GROUP_SIZE][GROUP_SIZE];
+shared MP float s_depth_width[GROUP_SIZE/GRAD_DWN][GROUP_SIZE/GRAD_DWN];
 
 #include "utils.glsl"
 #include "asvgf.glsl"
@@ -211,9 +218,14 @@ main()
 			vec3  normal_prev = decode_normal(texelFetch(TEX_PT_NORMAL_B, p, 0).x);
 			vec3  geo_normal_prev = decode_normal(texelFetch(TEX_PT_GEO_NORMAL_B, p, 0).x);
 
-			float dist_depth = abs(depth_curr - depth_prev + motion.z) / abs(depth_curr);
+			// depth_* come straight out of r16f images and motion.z out of rgba16f,
+			// so the fp16 rounding here already happened in memory. The test below
+			// is against 0.1, three orders above fp16 noise at this magnitude.
+			MP float dist_depth = abs(depth_curr - depth_prev + motion.z) / abs(depth_curr);
+			// dot_normals stays full precision: it feeds pow(.., shininess) below,
+			// where an exponent of up to 32 turns fp16 steps near 1.0 into ~4% jumps.
 			float dot_normals = dot(normal_curr, normal_prev);
-			float dot_geo_normals = dot(geo_normal_curr, geo_normal_prev);
+			MP float dot_geo_normals = dot(geo_normal_curr, geo_normal_prev);
 			
 			if(depth_curr < 0)
 			{
@@ -274,7 +286,7 @@ main()
 				float lum_p_hf;
 				get_shared_data(ivec2(xx, yy), depth, normal, lum_p_hf);
 
-				float dist_z = abs(depth_curr - depth) * motion.a;
+				MP float dist_z = abs(depth_curr - depth) * motion.a;
 				if(dist_z < 2.0) {
 					float w_hf = pow(max(0.0, dot(normal, normal_curr)), 128.0);
 
@@ -299,26 +311,29 @@ main()
 	vec4 out_moments_histlen_hf;
 
 	// Load the gradients
-	float grad_lf = texelFetch(TEX_ASVGF_GRAD_LF_PONG, ipos / GRAD_DWN, 0).r;
-	vec2 grad_hf_spec = texelFetch(TEX_ASVGF_GRAD_HF_SPEC_PONG, ipos / GRAD_DWN, 0).rg;
+	MP float grad_lf = texelFetch(TEX_ASVGF_GRAD_LF_PONG, ipos / GRAD_DWN, 0).r;
+	MP vec2 grad_hf_spec = texelFetch(TEX_ASVGF_GRAD_HF_SPEC_PONG, ipos / GRAD_DWN, 0).rg;
 	grad_lf = clamp(grad_lf, 0, 1);
 	grad_hf_spec = clamp(grad_hf_spec, vec2(0), vec2(1));
 
 	if(temporal_sample_valid_diff)
 	{
 		// Compute the antilag factors based on the gradients
-		float antilag_alpha_lf = clamp(mix(1.0, global_ubo.flt_antilag_lf * grad_lf, global_ubo.flt_temporal_lf), 0, 1);
-		float antilag_alpha_hf = clamp(mix(1.0, global_ubo.flt_antilag_hf * grad_hf_spec.x, global_ubo.flt_temporal_hf), 0, 1);
+		MP float antilag_alpha_lf = clamp(mix(1.0, global_ubo.flt_antilag_lf * grad_lf, global_ubo.flt_temporal_lf), 0, 1);
+		MP float antilag_alpha_hf = clamp(mix(1.0, global_ubo.flt_antilag_hf * grad_hf_spec.x, global_ubo.flt_temporal_hf), 0, 1);
 
-		// Adjust the history length, taking the antilag factors into account
-		float hist_len_hf = min(temporal_moments_histlen_hf.b * pow(1.0 - antilag_alpha_hf, 10) + 1.0, 256.0);
-		float hist_len_lf = min(temporal_moments_histlen_hf.a * pow(1.0 - antilag_alpha_lf, 10) + 1.0, 256.0);
+		// Adjust the history length, taking the antilag factors into account.
+		// Capped at 256 and only ever incremented by 1.0, and integers are exact
+		// in fp16 up to 2048, so the counter never stalls. Already stored rgba16f.
+		MP float hist_len_hf = min(temporal_moments_histlen_hf.b * pow(1.0 - antilag_alpha_hf, 10) + 1.0, 256.0);
+		MP float hist_len_lf = min(temporal_moments_histlen_hf.a * pow(1.0 - antilag_alpha_lf, 10) + 1.0, 256.0);
 
 		// Compute the blending weights based on history length, so that the filter
 		// converges faster. I.e. the first frame has weight of 1.0, the second frame 1/2, third 1/3 and so on.
-		float alpha_color_lf = max(global_ubo.flt_min_alpha_color_lf, 1.0 / hist_len_lf);
-		float alpha_color_hf = max(global_ubo.flt_min_alpha_color_hf, 1.0 / hist_len_hf);
-		float alpha_moments_hf = max(global_ubo.flt_min_alpha_moments_hf, 1.0 / hist_len_hf);
+		// Smallest value reachable is 1/256 = 3.9e-3, well inside fp16 normal range.
+		MP float alpha_color_lf = max(global_ubo.flt_min_alpha_color_lf, 1.0 / hist_len_lf);
+		MP float alpha_color_hf = max(global_ubo.flt_min_alpha_color_hf, 1.0 / hist_len_hf);
+		MP float alpha_moments_hf = max(global_ubo.flt_min_alpha_moments_hf, 1.0 / hist_len_hf);
 
 		// Adjust the blending factors, taking the antilag factors into account again
 		alpha_color_lf = mix(alpha_color_lf, 1.0, antilag_alpha_lf);

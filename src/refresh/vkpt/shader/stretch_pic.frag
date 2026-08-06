@@ -25,6 +25,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_nonuniform_qualifier    : enable
 
+// glslang warns once per fragment shader that uses a precision qualifier in the
+// Vulkan desktop profile unless the defaults are stated explicitly. These match
+// what the profile already does; only the MP-annotated declarations are relaxed.
+precision highp float;
+precision highp int;
+
 layout(constant_id = 0) const uint spec_tone_mapping_hdr = 0;
 
 #define GLOBAL_TEXTURES_DESC_SET_IDX 1
@@ -46,7 +52,9 @@ layout(location = 0) out vec4 outColor;
 void
 main()
 {
-	vec4 c = color;
+	// UI color is [0,1] and hdr_color_scale is nits/80 (<= ~12.5), so nothing
+	// here comes close to the fp16 range. tex_coord stays full precision.
+	MP vec4 c = color;
 	if(tex_id != ~0u) {
 		vec2 tc = tex_coord;
 		c *= global_textureLod(tex_id, tc, 0);

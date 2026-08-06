@@ -74,7 +74,18 @@ static StretchPic_t stretch_pic_queue[MAX_STRETCH_PICS];
 
 static VkPipelineLayout        pipeline_layout_stretch_pic;
 static VkPipelineLayout        pipeline_layout_final_blit;
-static VkRenderPass            render_pass_stretch_pic;
+// Two variants of the same pass, differing only in loadOp. The frame opens with
+// a full-screen blit that covers every pixel, so on that path the swapchain's
+// prior contents are dead and DISCARD saves a full tile load; when the blit is
+// skipped (no frame ready) the HUD composites onto what is already there and the
+// contents must be loaded. They are render-pass-compatible, so one set of
+// framebuffers and pipelines serves both.
+enum {
+	SWAPCHAIN_PASS_LOAD,
+	SWAPCHAIN_PASS_DISCARD,
+	SWAPCHAIN_PASS_NUM_VARIANTS
+};
+static VkRenderPass            render_pass_stretch_pic[SWAPCHAIN_PASS_NUM_VARIANTS];
 static VkPipeline              pipeline_stretch_pic[STRETCH_PIC_NUM_PIPELINES];
 static VkPipeline              pipeline_final_blit[FINAL_BLIT_NUM_PIPELINES];
 static VkFramebuffer*          framebuffer_stretch_pic = NULL;
@@ -201,9 +212,7 @@ create_render_pass(void)
 	VkAttachmentDescription color_attachment = {
 		.format         = qvk.surf_format.format,
 		.samples        = VK_SAMPLE_COUNT_1_BIT,
-		.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
-		//.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-		//.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD, /* overwritten per variant below */
 		.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
 		.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_CLEAR,
 		.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -244,8 +253,20 @@ create_render_pass(void)
 		.pDependencies   = dependencies,
 	};
 
-	_VK(vkCreateRenderPass(qvk.device, &render_pass_info, NULL, &render_pass_stretch_pic));
-	ATTACH_LABEL_VARIABLE(render_pass_stretch_pic, RENDER_PASS);
+	for (int i = 0; i < SWAPCHAIN_PASS_NUM_VARIANTS; i++) {
+		color_attachment.loadOp = (i == SWAPCHAIN_PASS_DISCARD)
+			? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+			: VK_ATTACHMENT_LOAD_OP_LOAD;
+
+		// DONT_CARE leaves the contents undefined, so there is nothing for the
+		// pass to preserve and no reason to claim it inherits PRESENT_SRC.
+		color_attachment.initialLayout = (i == SWAPCHAIN_PASS_DISCARD)
+			? VK_IMAGE_LAYOUT_UNDEFINED
+			: VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+		_VK(vkCreateRenderPass(qvk.device, &render_pass_info, NULL, &render_pass_stretch_pic[i]));
+		ATTACH_LABEL_VARIABLE(render_pass_stretch_pic[i], RENDER_PASS);
+	}
 }
 
 VkResult
@@ -481,8 +502,10 @@ vkpt_draw_destroy_pipelines()
 	free(framebuffer_stretch_pic);
 	framebuffer_stretch_pic = NULL;
 
-	vkDestroyRenderPass(qvk.device, render_pass_stretch_pic, NULL);
-	
+	for(int i = 0; i < SWAPCHAIN_PASS_NUM_VARIANTS; i++) {
+		vkDestroyRenderPass(qvk.device, render_pass_stretch_pic[i], NULL);
+	}
+
 	return VK_SUCCESS;
 }
 
@@ -638,7 +661,7 @@ vkpt_draw_create_pipelines()
 		.pDynamicState       = NULL,
 		
 		.layout              = pipeline_layout_stretch_pic,
-		.renderPass          = render_pass_stretch_pic,
+		.renderPass          = render_pass_stretch_pic[SWAPCHAIN_PASS_LOAD],
 		.subpass             = 0,
 
 		.basePipelineHandle  = VK_NULL_HANDLE,
@@ -682,7 +705,7 @@ vkpt_draw_create_pipelines()
 
 		VkFramebufferCreateInfo fb_create_info = {
 			.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-			.renderPass      = render_pass_stretch_pic,
+			.renderPass      = render_pass_stretch_pic[SWAPCHAIN_PASS_LOAD],
 			.attachmentCount = 1,
 			.pAttachments    = attachments,
 			.width           = vkpt_draw_get_extent().width,
@@ -704,6 +727,39 @@ vkpt_draw_clear_stretch_pics()
 	return VK_SUCCESS;
 }
 
+bool
+vkpt_draw_have_stretch_pics(void)
+{
+	return num_stretch_pics != 0;
+}
+
+// The swapchain pass is opened by the caller rather than by each draw so that the
+// final blit and the HUD share one pass. On a tiler that is the difference
+// between two load/store cycles over the whole swapchain and one store.
+//
+// `discard` must only be set when the first thing recorded into the pass covers
+// every pixel of the render area -- i.e. when the full-screen blit runs.
+void
+vkpt_draw_begin_swapchain_pass(VkCommandBuffer cmd_buf, bool discard)
+{
+	VkRenderPassBeginInfo render_pass_info = {
+		.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderPass        = render_pass_stretch_pic[discard ? SWAPCHAIN_PASS_DISCARD : SWAPCHAIN_PASS_LOAD],
+		.framebuffer       = framebuffer_stretch_pic[qvk.current_swap_chain_image_index],
+		.renderArea.offset = { 0, 0 },
+		.renderArea.extent = vkpt_draw_get_extent()
+	};
+
+	vkCmdBeginRenderPass(cmd_buf, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+}
+
+void
+vkpt_draw_end_swapchain_pass(VkCommandBuffer cmd_buf)
+{
+	vkCmdEndRenderPass(cmd_buf);
+}
+
+// Records into the swapchain pass opened by vkpt_draw_begin_swapchain_pass().
 VkResult
 vkpt_draw_submit_stretch_pics(VkCommandBuffer cmd_buf)
 {
@@ -723,26 +779,16 @@ vkpt_draw_submit_stretch_pics(VkCommandBuffer cmd_buf)
 	buffer_unmap(ubo_res);
 	ubo = NULL;
 
-	VkRenderPassBeginInfo render_pass_info = {
-		.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-		.renderPass        = render_pass_stretch_pic,
-		.framebuffer       = framebuffer_stretch_pic[qvk.current_swap_chain_image_index],
-		.renderArea.offset = { 0, 0 },
-		.renderArea.extent = vkpt_draw_get_extent()
-	};
-
 	VkDescriptorSet desc_sets[] = {
 		desc_set_sbo[qvk.current_frame_index],
 		qvk_get_current_desc_set_textures(),
 		desc_set_ubo[qvk.current_frame_index],
 	};
 
-	vkCmdBeginRenderPass(cmd_buf, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
 	vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			pipeline_layout_stretch_pic, 0, LENGTH(desc_sets), desc_sets, 0, 0);
 	vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_stretch_pic[qvk.surf_is_hdr ? STRETCH_PIC_HDR : STRETCH_PIC_SDR]);
 	vkCmdDraw(cmd_buf, 4, num_stretch_pics, 0, 0);
-	vkCmdEndRenderPass(cmd_buf);
 
 	num_stretch_pics = 0;
 	return VK_SUCCESS;
@@ -751,9 +797,21 @@ vkpt_draw_submit_stretch_pics(VkCommandBuffer cmd_buf)
 VkResult
 vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D extent, bool filtered, bool warped)
 {
+	return vkpt_final_blit_view(cmd_buf, qvk.images_views[image_index], extent, filtered, warped);
+}
+
+// Same, for an image that is not one of the screen images: the NPU upscaler owns
+// its output image rather than taking a VKPT_IMG_* slot, since its extent is the
+// model's scale times the render extent rather than anything
+// get_screen_image_extent() knows about.
+//
+// Records into the swapchain pass opened by vkpt_draw_begin_swapchain_pass().
+VkResult
+vkpt_final_blit_view(VkCommandBuffer cmd_buf, VkImageView image_view, VkExtent2D extent, bool filtered, bool warped)
+{
 	VkDescriptorImageInfo img_info_input = {
 		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-		.imageView   = qvk.images_views[image_index],
+		.imageView   = image_view,
 		.sampler     = qvk.tex_sampler,
 	};
 	VkImageView debug_lines_view = vpkt_debugdraw_imageview();
@@ -787,14 +845,6 @@ vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D ex
 
 	vkUpdateDescriptorSets(qvk.device, LENGTH(elem_images), elem_images, 0, NULL);
 
-	VkRenderPassBeginInfo render_pass_info = {
-		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-		.renderPass = render_pass_stretch_pic,
-		.framebuffer = framebuffer_stretch_pic[qvk.current_swap_chain_image_index],
-		.renderArea.offset = { 0, 0 },
-		.renderArea.extent = vkpt_draw_get_extent()
-	};
-
 	VkDescriptorSet desc_sets[] = {
 		qvk.desc_set_ubo,
 		desc_set_final_blit[qvk.current_frame_index]
@@ -802,7 +852,6 @@ vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D ex
 
 	FinalBlitPushConstants_t push_constants = {.input_dimensions = {extent.width, extent.height}};
 
-	vkCmdBeginRenderPass(cmd_buf, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
 	vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		pipeline_layout_final_blit, 0, LENGTH(desc_sets), desc_sets, 0, 0);
 	int pipeline_idx = (filtered ? FINAL_BLIT_FILTERED : 0) | (warped ? FINAL_BLIT_WARPED : 0);
@@ -810,7 +859,6 @@ vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D ex
 	vkCmdPushConstants(cmd_buf, pipeline_layout_final_blit,
 		VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_constants), &push_constants);
 	vkCmdDraw(cmd_buf, 4, 1, 0, 0);
-	vkCmdEndRenderPass(cmd_buf);
 
 	return VK_SUCCESS;
 }

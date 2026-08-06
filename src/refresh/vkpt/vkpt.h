@@ -494,6 +494,9 @@ void create_orthographic_matrix(mat4_t matrix, float xmin, float xmax,
 	PROFILER_DO(FSR,                        1) \
 	PROFILER_DO(FSR_EASU,                   2) \
 	PROFILER_DO(FSR_RCAS,                   2) \
+	PROFILER_DO(UPSCALER,                   1) \
+	PROFILER_DO(UPSCALER_DOWNLOAD,          2) \
+	PROFILER_DO(UPSCALER_UPLOAD,            2) \
 	PROFILER_DO(UPDATE_ENVIRONMENT,         1) \
 	PROFILER_DO(GOD_RAYS,                   1) \
 	PROFILER_DO(GOD_RAYS_REFLECT_REFRACT,   1) \
@@ -611,8 +614,16 @@ VkResult vkpt_draw_initialize(void);
 VkResult vkpt_draw_destroy(void);
 VkResult vkpt_draw_destroy_pipelines(void);
 VkResult vkpt_draw_create_pipelines(void);
+// The final blit and the HUD share one render pass over the swapchain, so the
+// caller opens it. Everything below between begin and end records draws only and
+// must not issue transfer or compute work. Pass discard=true only when the
+// full-screen blit runs first and overwrites every pixel.
+void vkpt_draw_begin_swapchain_pass(VkCommandBuffer cmd_buf, bool discard);
+void vkpt_draw_end_swapchain_pass(VkCommandBuffer cmd_buf);
+bool vkpt_draw_have_stretch_pics(void);
 VkResult vkpt_draw_submit_stretch_pics(VkCommandBuffer cmd_buf);
 VkResult vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D extent, bool filtered, bool warped);
+VkResult vkpt_final_blit_view(VkCommandBuffer cmd_buf, VkImageView image_view, VkExtent2D extent, bool filtered, bool warped);
 VkResult vkpt_draw_clear_stretch_pics(void);
 
 VkResult vkpt_uniform_buffer_create(void);
@@ -699,6 +710,45 @@ bool vkpt_fsr_needs_upscale(void);
 void vkpt_fsr_update_ubo(QVKUniformBuffer_t *ubo);
 VkResult vkpt_fsr_do(VkCommandBuffer cmd_buf);
 VkResult vkpt_fsr_final_blit(VkCommandBuffer cmd_buf, bool warp);
+
+// Render-extent width alignment that keeps the upscaler's staging images
+// aliasable. A linear image can stand in for the tightly packed tensor only when
+// the driver's row pitch is exactly width * 4 bytes; pitches are aligned (64
+// bytes is typical, i.e. a multiple of 16 texels), so an arbitrary width costs a
+// full-frame copy in each direction. See get_render_extent() in main.c.
+#define UPSCALER_WIDTH_ALIGN 16
+
+void vkpt_upscaler_init_cvars(void);
+VkResult vkpt_upscaler_initialize(void);
+VkResult vkpt_upscaler_destroy(void);
+VkResult vkpt_upscaler_create_pipelines(void);
+VkResult vkpt_upscaler_destroy_pipelines(void);
+bool vkpt_upscaler_is_enabled(void);
+// The loaded model's integer scale factor, or 0 when the upscaler will not run.
+// While it is non-zero the upscaler owns the resolution policy and viewsize is
+// ignored; see vkpt_upscaler_get_render_extent(). It is also how the frame graph
+// decides whether the upscaler is in it; see upscaler_active_this_frame() in
+// main.c.
+uint32_t vkpt_upscaler_get_scale(void);
+// The render extent to use while the upscaler is active, derived from the display
+// extent: display/scale by default, or flt_upscaler_render_scale percent of the
+// display when that is set. Only meaningful when vkpt_upscaler_get_scale() > 1;
+// returns the display extent unchanged otherwise.
+VkExtent2D vkpt_upscaler_get_render_extent(VkExtent2D display);
+VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
+// Records the copy that lands last frame's inference result in a sampleable
+// image. It is transfer work, so it must be recorded before the swapchain render
+// pass is opened; vkpt_upscaler_final_blit() then draws from what it produced.
+// Must be paired with exactly one vkpt_upscaler_final_blit() call.
+void vkpt_upscaler_record_upload(VkCommandBuffer cmd_buf);
+VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
+// The fence the command buffer carrying vkpt_upscaler_do()'s transfer into the
+// input tensor must signal, or VK_NULL_HANDLE when it carries none. It is what
+// next frame's inference waits on instead of draining the queue.
+VkFence vkpt_upscaler_download_fence(void);
+// Drops any tensor the upscaler has in flight. Must be called on frames that
+// skip vkpt_upscaler_final_blit(), which is what would otherwise consume it.
+void vkpt_upscaler_discard(void);
 
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);

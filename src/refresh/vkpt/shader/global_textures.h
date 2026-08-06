@@ -57,7 +57,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	IMG_DO(ASVGF_GRAD_HF_SPEC_PONG,   17, R16G16_SFLOAT,       rg16f,   IMG_WIDTH_GRAD_MGPU, IMG_HEIGHT_GRAD) \
 	IMG_DO(PT_SHADING_POSITION,       18, R32G32B32A32_SFLOAT, rgba32f, IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(FLAT_COLOR,                19, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
-	IMG_DO(FLAT_MOTION,               20, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(FLAT_MOTION,               20, R16G16_SFLOAT,       rg16f,   IMG_WIDTH,           IMG_HEIGHT     ) \
 	IMG_DO(PT_GODRAYS_THROUGHPUT_DIST,21, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(BLOOM_HBLUR,               22, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH_TAA / 4,   IMG_HEIGHT_TAA / 4 ) \
 	IMG_DO(BLOOM_VBLUR,               23, R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH_TAA / 4,   IMG_HEIGHT_TAA / 4 ) \
@@ -89,8 +89,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	IMG_DO(PT_BASE_COLOR_B,           NUM_IMAGES_BASE + 7,  R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_METALLIC_A,             NUM_IMAGES_BASE + 8,  R8G8_UNORM,          rg8,     IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_METALLIC_B,             NUM_IMAGES_BASE + 9,  R8G8_UNORM,          rg8,     IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
-	IMG_DO(PT_VIEW_DEPTH_A,           NUM_IMAGES_BASE + 10, R16_SFLOAT,          r32f,    IMG_WIDTH,           IMG_HEIGHT     ) \
-	IMG_DO(PT_VIEW_DEPTH_B,           NUM_IMAGES_BASE + 11, R16_SFLOAT,          r32f,    IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(PT_VIEW_DEPTH_A,           NUM_IMAGES_BASE + 10, R16_SFLOAT,          r16f,    IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(PT_VIEW_DEPTH_B,           NUM_IMAGES_BASE + 11, R16_SFLOAT,          r16f,    IMG_WIDTH,           IMG_HEIGHT     ) \
 	IMG_DO(PT_NORMAL_A,               NUM_IMAGES_BASE + 12, R32_UINT,            r32ui,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_NORMAL_B,               NUM_IMAGES_BASE + 13, R32_UINT,            r32ui,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_GEO_NORMAL_A,           NUM_IMAGES_BASE + 14, R32_UINT,            r32ui,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
@@ -121,8 +121,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	IMG_DO(PT_BASE_COLOR_A,           NUM_IMAGES_BASE + 7,  R16G16B16A16_SFLOAT, rgba16f, IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_METALLIC_B,             NUM_IMAGES_BASE + 8,  R8G8_UNORM,          rg8,     IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_METALLIC_A,             NUM_IMAGES_BASE + 9,  R8G8_UNORM,          rg8,     IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
-	IMG_DO(PT_VIEW_DEPTH_B,           NUM_IMAGES_BASE + 10, R16_SFLOAT,          r32f,    IMG_WIDTH,           IMG_HEIGHT     ) \
-	IMG_DO(PT_VIEW_DEPTH_A,           NUM_IMAGES_BASE + 11, R16_SFLOAT,          r32f,    IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(PT_VIEW_DEPTH_B,           NUM_IMAGES_BASE + 10, R16_SFLOAT,          r16f,    IMG_WIDTH,           IMG_HEIGHT     ) \
+	IMG_DO(PT_VIEW_DEPTH_A,           NUM_IMAGES_BASE + 11, R16_SFLOAT,          r16f,    IMG_WIDTH,           IMG_HEIGHT     ) \
 	IMG_DO(PT_NORMAL_B,               NUM_IMAGES_BASE + 12, R32_UINT,            r32ui,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_NORMAL_A,               NUM_IMAGES_BASE + 13, R32_UINT,            r32ui,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
 	IMG_DO(PT_GEO_NORMAL_B,           NUM_IMAGES_BASE + 14, R32_UINT,            r32ui,   IMG_WIDTH_MGPU,      IMG_HEIGHT     ) \
@@ -185,6 +185,7 @@ enum QVK_IMAGES {
 typedef char compile_time_check_num_images[(NUM_IMAGES == NUM_VKPT_IMAGES)*2-1];
 
 #elif defined(GLOBAL_TEXTURES_DESC_SET_IDX)
+#include "precision.glsl"
 /***************************************************************************/
 /* SHADER CODE                                                             */
 /***************************************************************************/
@@ -199,6 +200,7 @@ layout(
 #define SAMPLER_r32ui   usampler2D
 #define SAMPLER_rg32ui  usampler2D
 #define SAMPLER_r32i    isampler2D
+#define SAMPLER_r16f    sampler2D
 #define SAMPLER_r32f    sampler2D
 #define SAMPLER_rg32f   sampler2D
 #define SAMPLER_rg16f   sampler2D
@@ -212,6 +214,7 @@ layout(
 #define IMAGE_r32ui   uimage2D
 #define IMAGE_rg32ui  uimage2D
 #define IMAGE_r32i    iimage2D
+#define IMAGE_r16f    image2D
 #define IMAGE_r32f    image2D
 #define IMAGE_rg32f   image2D
 #define IMAGE_rg16f   image2D
@@ -301,7 +304,11 @@ layout(
 ) uniform sampler2D TEX_TERRAIN_SHADOWMAP;
 //#precomputed_sky end
 
-vec4
+/* The material textures behind these three are R8G8B8A8_SRGB/UNORM or R16_UNORM
+   (textures.c), so the fetched value never needs more than 16 bits. The tex_coord
+   inputs stay full precision -- scrolling BSP surfaces push them well outside
+   [0,1], and the LOD/gradient math that feeds textureGrad is range-critical. */
+MP vec4
 global_texture(uint idx, vec2 tex_coord)
 {
 	if(idx >= NUM_GLOBAL_TEXTURES)
@@ -309,7 +316,7 @@ global_texture(uint idx, vec2 tex_coord)
 	return texture(global_texture_descriptors[nonuniformEXT(idx)], tex_coord);
 }
 
-vec4
+MP vec4
 global_textureLod(uint idx, vec2 tex_coord, float lod)
 {
 	if(idx >= NUM_GLOBAL_TEXTURES)
@@ -317,7 +324,7 @@ global_textureLod(uint idx, vec2 tex_coord, float lod)
 	return textureLod(global_texture_descriptors[nonuniformEXT(idx)], tex_coord, lod);
 }
 
-vec4
+MP vec4
 global_textureGrad(uint idx, vec2 tex_coord, vec2 d_x, vec2 d_y)
 {
 	if(idx >= NUM_GLOBAL_TEXTURES)

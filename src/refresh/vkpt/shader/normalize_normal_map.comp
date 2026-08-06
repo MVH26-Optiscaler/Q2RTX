@@ -17,7 +17,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 
 #version 460
+#extension GL_GOOGLE_include_directive    : enable
 #extension GL_EXT_nonuniform_qualifier    : enable
+
+#include "precision.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -32,11 +35,13 @@ main()
 {
     ivec2 ipos = ivec2(gl_GlobalInvocationID);
 
-    vec4 value = imageLoad(global_texture_images[push.texture_index], ipos);
+    // Source and destination are both rgba8, so the storage quantum (1/255) is
+    // ~4x coarser than fp16 error anywhere in [-1,1]. Nothing here can overflow.
+    MP vec4 value = imageLoad(global_texture_images[push.texture_index], ipos);
 
     value.xy = value.xy * 2.0 - vec2(1.0);
-    
-    float len = length(value.xyz);
+
+    MP float len = length(value.xyz);
     if (len == 0)
         value.xyz = vec3(0.0, 0.0, 1.0);
     else
