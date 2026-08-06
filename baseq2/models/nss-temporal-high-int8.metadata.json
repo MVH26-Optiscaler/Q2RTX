@@ -1,0 +1,46 @@
+{
+    "model_id": "nss-temporal-high",
+    "model_name": "Arm Neural Super Sampling (high, 6x6 KPN)",
+    "source": "https://huggingface.co/Arm/neural-super-sampling, nss_v1_0_1_high_int8.pt, exported via tools/export_onnx_int8.py",
+    "runtime": "onnx",
+    "precision": "int8 QDQ (QuantizeLinear/DequantizeLinear activations, per-channel int8 weights)",
+    "kind": "temporal",
+    "note": "Unlike the QuickSRNet models, graph I/O tensors are FLOAT32 -- the QAT export bakes QuantizeLinear/DequantizeLinear at the boundary rather than exposing raw uint8/int8 tensors, so upscaler.c must not assume UINT8 element type for this model.",
+    "model_files": {
+        "nss-temporal-high-int8.onnx": {
+            "inputs": {
+                "_PreprocessTensor": {
+                    "shape": [1, 12, 544, 960],
+                    "dtype": "float32",
+                    "internal_quantization": {
+                        "scheme": "SINT8 asymmetric",
+                        "scale": 0.003912401385605335,
+                        "zero_point": -128
+                    }
+                }
+            },
+            "outputs": {
+                "_KpnCoefficients": {
+                    "shape": [1, 36, 136, 240],
+                    "dtype": "float32",
+                    "internal_quantization": {
+                        "scheme": "SINT8 asymmetric",
+                        "scale": 0.003937007859349251,
+                        "zero_point": -127
+                    },
+                    "note": "sigmoid-activated 6x6 kernel-prediction coefficients, applied by nss_reconstruct.comp"
+                },
+                "_TemporalTensor": {
+                    "shape": [1, 4, 544, 960],
+                    "dtype": "float32",
+                    "internal_quantization": {
+                        "scheme": "SINT8 asymmetric",
+                        "scale": 0.003937007859349251,
+                        "zero_point": -127
+                    },
+                    "note": "sigmoid-activated temporal blend tensor, consumed by nss_reconstruct.comp and fed back as history next frame"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,153 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "installDir": "${sourceDir}/build/${presetName}/install",
+      "cacheVariables": {
+        "CONFIG_VKPT_RENDERER": "ON"
+      }
+    },
+
+    {
+      "name": "win-base",
+      "hidden": true,
+      "inherits": "base",
+      "description": "Windows, default (Visual Studio) generator. Left unset on purpose so this resolves to whichever VS is installed rather than pinning a version.",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+
+    {
+      "name": "arm64",
+      "displayName": "Windows ARM64 (Snapdragon, NPU on)",
+      "description": "Native Snapdragon build with the NSS temporal upscaler. USE_ORT_QNN_UPSCALER already defaults ON here; set explicitly so the preset states its intent. First configure downloads the ONNX Runtime QNN package from NuGet. Needs spirv-opt from the Vulkan SDK on PATH or under C:/VulkanSDK.",
+      "inherits": "win-base",
+      "architecture": { "value": "ARM64", "strategy": "set" },
+      "cacheVariables": {
+        "USE_ORT_QNN_UPSCALER": "ON"
+      }
+    },
+
+    {
+      "name": "arm64-nonpu",
+      "displayName": "Windows ARM64 (no NPU)",
+      "description": "Snapdragon build with the NSS path compiled out. Skips the NuGet download entirely, so it configures in seconds -- use it for quick iteration on renderer code, or on a machine with no network. Exercises the #else stub block in upscaler.c.",
+      "inherits": "win-base",
+      "architecture": { "value": "ARM64", "strategy": "set" },
+      "cacheVariables": {
+        "USE_ORT_QNN_UPSCALER": "OFF"
+      }
+    },
+
+    {
+      "name": "arm64-devtools",
+      "displayName": "Windows ARM64 (NPU + shader debug + image dumps)",
+      "description": "As arm64, plus shader debug info and the image-dump machinery. This is the build to use when debugging the NSS passes: it makes the pack/reconstruct shaders steppable in RenderDoc/Nsight and enables VKPT_IMAGE_DUMPS alongside the upscaler_dump console command.",
+      "inherits": "arm64",
+      "cacheVariables": {
+        "CONFIG_BUILD_SHADER_DEBUG_INFO": "ON",
+        "CONFIG_VKPT_ENABLE_IMAGE_DUMPS": "ON"
+      }
+    },
+
+    {
+      "name": "arm64-ship",
+      "displayName": "Windows ARM64 (NPU, IPO)",
+      "description": "As arm64 with interprocedural optimization on. Slow to link; meant for a build you intend to keep, not for iteration. Pair with the Release build preset.",
+      "inherits": "arm64",
+      "cacheVariables": {
+        "CONFIG_BUILD_IPO": "ON"
+      }
+    },
+
+    {
+      "name": "x64",
+      "displayName": "Windows x64 (no NPU)",
+      "description": "Cross-compiles x64 from any Windows host. The NPU path is ARM64-only, so it is off here and cannot be turned on -- the ONNX Runtime QNN package ships an ARM64 import library only, and linking it into an x64 client fails on OrtGetApiBase. Useful for checking that renderer changes still build on the non-NPU path.",
+      "inherits": "win-base",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "cacheVariables": {
+        "USE_ORT_QNN_UPSCALER": "OFF"
+      }
+    },
+
+    {
+      "name": "linux",
+      "displayName": "Linux x64",
+      "description": "Ninja Multi-Config so the Debug/Release/RelWithDebInfo build presets below work the same way they do against Visual Studio. The NPU path is Windows-only.",
+      "inherits": "base",
+      "generator": "Ninja Multi-Config",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "USE_ORT_QNN_UPSCALER": "OFF"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "arm64-debug",          "displayName": "ARM64 Debug",          "configurePreset": "arm64",          "configuration": "Debug" },
+    { "name": "arm64-release",        "displayName": "ARM64 Release",        "configurePreset": "arm64",          "configuration": "Release" },
+    { "name": "arm64-relwithdebinfo", "displayName": "ARM64 RelWithDebInfo", "configurePreset": "arm64",          "configuration": "RelWithDebInfo" },
+    {
+      "name": "arm64-client",
+      "displayName": "ARM64 Release, client only",
+      "description": "Skips the dedicated server and the game module. This is the one to use while iterating on the renderer.",
+      "configurePreset": "arm64",
+      "configuration": "Release",
+      "targets": [ "client" ]
+    },
+
+    { "name": "arm64-nonpu-debug",   "displayName": "ARM64 (no NPU) Debug",   "configurePreset": "arm64-nonpu",    "configuration": "Debug" },
+    { "name": "arm64-nonpu-release", "displayName": "ARM64 (no NPU) Release", "configurePreset": "arm64-nonpu",    "configuration": "Release" },
+
+    { "name": "arm64-devtools-debug",          "displayName": "ARM64 devtools Debug",          "configurePreset": "arm64-devtools", "configuration": "Debug" },
+    { "name": "arm64-devtools-relwithdebinfo", "displayName": "ARM64 devtools RelWithDebInfo", "configurePreset": "arm64-devtools", "configuration": "RelWithDebInfo" },
+
+    { "name": "arm64-ship-release", "displayName": "ARM64 ship Release (IPO)", "configurePreset": "arm64-ship", "configuration": "Release" },
+
+    { "name": "x64-debug",   "displayName": "x64 Debug",   "configurePreset": "x64", "configuration": "Debug" },
+    { "name": "x64-release", "displayName": "x64 Release", "configurePreset": "x64", "configuration": "Release" },
+    {
+      "name": "x64-client",
+      "displayName": "x64 Release, client only",
+      "configurePreset": "x64",
+      "configuration": "Release",
+      "targets": [ "client" ]
+    },
+
+    { "name": "linux-debug",          "displayName": "Linux Debug",          "configurePreset": "linux", "configuration": "Debug",          "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" } },
+    { "name": "linux-release",        "displayName": "Linux Release",        "configurePreset": "linux", "configuration": "Release",        "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" } },
+    { "name": "linux-relwithdebinfo", "displayName": "Linux RelWithDebInfo", "configurePreset": "linux", "configuration": "RelWithDebInfo", "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" } }
+  ],
+
+  "workflowPresets": [
+    {
+      "name": "arm64",
+      "displayName": "Configure + build ARM64 Release (NPU)",
+      "steps": [
+        { "type": "configure", "name": "arm64" },
+        { "type": "build", "name": "arm64-release" }
+      ]
+    },
+    {
+      "name": "arm64-nonpu",
+      "displayName": "Configure + build ARM64 Release (no NPU)",
+      "steps": [
+        { "type": "configure", "name": "arm64-nonpu" },
+        { "type": "build", "name": "arm64-nonpu-release" }
+      ]
+    },
+    {
+      "name": "x64",
+      "displayName": "Configure + build x64 Release (no NPU)",
+      "steps": [
+        { "type": "configure", "name": "x64" },
+        { "type": "build", "name": "x64-release" }
+      ]
+    }
+  ]
+}

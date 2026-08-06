@@ -34,6 +34,9 @@ void    Sys_FreeLibrary(void *handle);
 void    *Sys_GetProcAddress(void *handle, const char *sym);
 
 unsigned Sys_Milliseconds(void);
+// Same monotonic clock as Sys_Milliseconds(), without the truncation to whole
+// milliseconds. For timing spans too short for Sys_Milliseconds() to resolve.
+uint64_t Sys_Nanoseconds(void);
 void     Sys_Sleep(int msec);
 
 void    Sys_Init(void);

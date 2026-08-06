@@ -18,6 +18,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 
 #include "shared/shared.h"
+#ifdef _WIN32
+#include <malloc.h> // alloca() -- MSVC ARM64 needs this in scope for it to resolve as an intrinsic
+#endif
 #include "common/bsp.h"
 #include "common/cmd.h"
 #include "common/common.h"
@@ -42,7 +45,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "shader/vertex_buffer.h"
 
-#include <vulkan/vulkan.h>
+// Vulkan comes in through vkpt.h -> volk.h above.
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -175,6 +178,8 @@ VkptInit_t vkpt_initialization[] = {
 	{ "tonemap|", vkpt_tone_mapping_create_pipelines,  vkpt_tone_mapping_destroy_pipelines,  VKPT_INIT_RELOAD_SHADER,      0 },
 	{ "fsr",      vkpt_fsr_initialize,                 vkpt_fsr_destroy,                     VKPT_INIT_DEFAULT,            0 },
 	{ "fsr|",     vkpt_fsr_create_pipelines,           vkpt_fsr_destroy_pipelines,           VKPT_INIT_RELOAD_SHADER,      0 },
+	{ "upscaler",  vkpt_upscaler_initialize,           vkpt_upscaler_destroy,                VKPT_INIT_DEFAULT,            0 },
+	{ "upscaler|", vkpt_upscaler_create_pipelines,     vkpt_upscaler_destroy_pipelines,      VKPT_INIT_RELOAD_SHADER,      0 },
 
 	{ "physicalSky", vkpt_physical_sky_initialize,         vkpt_physical_sky_destroy,            VKPT_INIT_DEFAULT,        0 },
 	{ "physicalSky|", vkpt_physical_sky_create_pipelines,  vkpt_physical_sky_destroy_pipelines,  VKPT_INIT_RELOAD_SHADER,  0 },
@@ -231,8 +236,27 @@ static inline bool extents_equal(VkExtent2D a, VkExtent2D b)
 	return a.width == b.width && a.height == b.height;
 }
 
+static bool is_accumulation_rendering_active(void);
+
+// Whether the NSS temporal upscaler runs this frame. Accumulation ("photo")
+// mode renders at full resolution over many frames for quality and reconstructs
+// nothing, so it wins.
+static bool upscaler_active_this_frame(void)
+{
+	return vkpt_upscaler_is_enabled() && !is_accumulation_rendering_active();
+}
+
 static VkExtent2D get_render_extent(void)
 {
+	// The NSS temporal upscaler was exported at one fixed input shape (see
+	// nss-temporal-high-int8.onnx / tools/export_onnx_int8.py in the
+	// neural-super-sampling checkout), so it cannot tile or crop to an
+	// arbitrary extent the way a spatial upscaler could. While NSS is loaded,
+	// viewsize/DRS have no effect on render resolution.
+	VkExtent2D temporal_extent;
+	if (vkpt_upscaler_get_temporal_extent(&temporal_extent))
+		return temporal_extent;
+
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -264,8 +288,8 @@ static VkExtent2D get_screen_image_extent(void)
 	{
 		int image_scale = max(cvar_drs_minscale->integer, cvar_drs_maxscale->integer);
 
-		// In case FSR enable we'll always upscale to 100% and thus need at least the unscaled extent
-		if(vkpt_fsr_is_enabled())
+		// FSR and the NPU upscaler always upscale to 100% and thus need at least the unscaled extent
+		if(vkpt_fsr_is_enabled() || vkpt_upscaler_is_enabled())
 			image_scale = max(image_scale, 100);
 
 		result.width = (uint32_t)(qvk.extent_unscaled.width * (float)image_scale / 100.f);
@@ -275,6 +299,19 @@ static VkExtent2D get_screen_image_extent(void)
 	{
 		result.width = max(qvk.extent_render.width, qvk.extent_unscaled.width);
 		result.height = max(qvk.extent_render.height, qvk.extent_unscaled.height);
+	}
+
+	// NSS's reconstruct pass writes a corner sub-rect sized at its model's
+	// true output extent (render extent at an exact 2x scale -- see
+	// nss_reconstruct.comp's header), which can exceed qvk.extent_unscaled
+	// when the real window/display is smaller than that (e.g. a windowed
+	// client below ~1920x1088). Floor unconditionally so IMG_WIDTH/HEIGHT is
+	// always big enough for that write, regardless of which branch above ran.
+	VkExtent2D nss_extent;
+	if (vkpt_upscaler_get_temporal_extent(&nss_extent))
+	{
+		result.width = max(result.width, nss_extent.width * 2);
+		result.height = max(result.height, nss_extent.height * 2);
 	}
 
 	result.width = (result.width + 1) & ~1;
@@ -406,13 +443,6 @@ QVK_t qvk = {
 	.draw_height        = 1080,
 	.frame_counter      = 0,
 };
-
-#define VK_EXTENSION_DO(a) PFN_##a q##a = 0;
-LIST_EXTENSIONS_ACCEL_STRUCT
-LIST_EXTENSIONS_RAY_PIPELINE
-LIST_EXTENSIONS_DEBUG
-LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
 
 const char *vk_validation_layers[] = {
 	"VK_LAYER_KHRONOS_validation"
@@ -548,35 +578,6 @@ vk_debug_callback(
 
 	Com_EPrintf("\n");
 	return VK_FALSE;
-}
-
-VkResult
-qvkCreateDebugUtilsMessengerEXT(
-		VkInstance instance,
-		const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
-		const VkAllocationCallbacks* pAllocator,
-		VkDebugUtilsMessengerEXT* pCallback)
-{
-	PFN_vkCreateDebugUtilsMessengerEXT func = (PFN_vkCreateDebugUtilsMessengerEXT)
-		vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
-	if(func)
-		return func(instance, pCreateInfo, pAllocator, pCallback);
-	return VK_ERROR_EXTENSION_NOT_PRESENT;
-}
-
-VkResult
-qvkDestroyDebugUtilsMessengerEXT(
-		VkInstance instance,
-		VkDebugUtilsMessengerEXT callback,
-		const VkAllocationCallbacks* pAllocator)
-{
-	PFN_vkDestroyDebugUtilsMessengerEXT func = (PFN_vkDestroyDebugUtilsMessengerEXT)
-		vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
-	if(func) {
-		func(instance, callback, pAllocator);
-		return VK_SUCCESS;
-	}
-	return VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
 static bool pick_surface_format_hdr(picked_surface_format_t* picked_fmt, const VkSurfaceFormatKHR avail_surface_formats[], size_t num_avail_surface_formats)
@@ -861,10 +862,47 @@ append_string_list(const char** dst, uint32_t* dst_count, uint32_t dst_capacity,
 	*dst_count += src_count;
 }
 
+/*
+ * Point volk at a Vulkan loader. Every vk* symbol is a function pointer that
+ * volk fills in, so nothing here works until this has run.
+ *
+ * Deliberately re-run on every init_vulkan() (i.e. on vid_restart) rather than
+ * cached: SDL owns the loader handle we borrow below, and it is free to unload
+ * it when the Vulkan window goes away.
+ */
+static bool
+init_volk(void)
+{
+	/* Prefer the loader SDL already opened for the SDL_WINDOW_VULKAN window, so
+	 * the instance we create and the surface SDL creates come from the same one.
+	 * Matters where the loader is overridden, e.g. the Steam runtime. */
+	PFN_vkGetInstanceProcAddr get_instance_proc_addr =
+		(PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr();
+
+	if (get_instance_proc_addr) {
+		volkInitializeCustom(get_instance_proc_addr);
+		return true;
+	}
+
+	VkResult result = volkInitialize();
+	if (result != VK_SUCCESS) {
+		Com_EPrintf("Couldn't load the Vulkan loader (vulkan-1.dll / libvulkan.so.1): %s\n"
+					"Install or update a Vulkan capable GPU driver, or run with "
+					"'+set vid_rtx 0' to use the OpenGL renderer.\n",
+					qvk_result_to_string(result));
+		return false;
+	}
+
+	return true;
+}
+
 bool
 init_vulkan(void)
 {
 	Com_Printf("----- init_vulkan -----\n");
+
+	if (!init_volk())
+		return false;
 
 	/* layers */
 	get_vk_layer_list(&qvk.num_layers, &qvk.layers);
@@ -964,11 +1002,8 @@ init_vulkan(void)
 		return false;
 	}
 
-#define VK_EXTENSION_DO(a) \
-		q##a = (PFN_##a) vkGetInstanceProcAddr(qvk.instance, #a); \
-		if (!q##a) { Com_EPrintf("warning: could not load instance function %s\n", #a); }
-	LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
+	/* Bind every instance-level entry point, including the debug utils ones. */
+	volkLoadInstance(qvk.instance);
 
 	/* setup debug callback */
 	VkDebugUtilsMessengerCreateInfoEXT dbg_create_info = {
@@ -983,7 +1018,8 @@ init_vulkan(void)
 		.pUserData = NULL
 	};
 
-	_VK(qvkCreateDebugUtilsMessengerEXT(qvk.instance, &dbg_create_info, NULL, &qvk.dbg_messenger));
+	if (vkCreateDebugUtilsMessengerEXT)
+		_VK(vkCreateDebugUtilsMessengerEXT(qvk.instance, &dbg_create_info, NULL, &qvk.dbg_messenger));
 
 	/* create surface */
 	if(!SDL_Vulkan_CreateSurface(qvk.window, qvk.instance, &qvk.surface)) {
@@ -1474,26 +1510,13 @@ init_vulkan(void)
 		return false;
 	}
 
+	/* Re-bind every entry point to this device, skipping the loader's dispatch
+	 * trampolines. Entry points whose extension was not enabled above stay NULL,
+	 * which is what the guards on the ray tracing and debug marker calls expect. */
+	volkLoadDevice(qvk.device);
+
 	vkGetDeviceQueue(qvk.device, qvk.queue_idx_graphics, 0, &qvk.queue_graphics);
 	vkGetDeviceQueue(qvk.device, qvk.queue_idx_transfer, 0, &qvk.queue_transfer);
-
-#define VK_EXTENSION_DO(a) \
-	q##a = (PFN_##a) vkGetDeviceProcAddr(qvk.device, #a); \
-	if(!q##a) { Com_EPrintf("warning: could not load function %s\n", #a); }
-
-	LIST_EXTENSIONS_ACCEL_STRUCT
-
-	if (!qvk.use_ray_query)
-	{
-		LIST_EXTENSIONS_RAY_PIPELINE
-	}
-
-	if(available_optional_device_extensions[OPT_EXT_VK_EXT_DEBUG_MARKER])
-	{
-		LIST_EXTENSIONS_DEBUG
-	}
-
-#undef VK_EXTENSION_DO
 
 	Com_Printf("-----------------------\n");
 
@@ -1644,7 +1667,8 @@ destroy_vulkan(void)
 	vkDestroyCommandPool(qvk.device, qvk.cmd_buffers_transfer.command_pool, NULL);
 
 	vkDestroyDevice(qvk.device,   NULL);
-	_VK(qvkDestroyDebugUtilsMessengerEXT(qvk.instance, qvk.dbg_messenger, NULL));
+	if (vkDestroyDebugUtilsMessengerEXT)
+		vkDestroyDebugUtilsMessengerEXT(qvk.instance, qvk.dbg_messenger, NULL);
 	vkDestroyInstance(qvk.instance, NULL);
 
 	free(qvk.extensions);
@@ -1655,13 +1679,9 @@ destroy_vulkan(void)
 	qvk.layers = NULL;
 	qvk.num_layers = 0;
 
-	// Clear the extension function pointers to make sure they don't refer non-requested extensions after vid_restart
-#define VK_EXTENSION_DO(a) q##a = NULL;
-	LIST_EXTENSIONS_ACCEL_STRUCT
-	LIST_EXTENSIONS_RAY_PIPELINE
-	LIST_EXTENSIONS_DEBUG
-	LIST_EXTENSIONS_INSTANCE
-#undef VK_EXTENSION_DO
+	// Clear the function pointers to make sure they don't refer non-requested extensions after vid_restart.
+	// init_volk() re-populates them on the next init_vulkan().
+	volkFinalize();
 
 	return 0;
 }
@@ -2638,13 +2658,30 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 		flt_taa = AA_MODE_UPSCALE;
 	}
 
+	// AA_MODE_NSS selects the NSS temporal upscaler, which is not an alternative
+	// to TAA but a consumer of it: nss_pack.comp reads TEX_TAA_OUTPUT, and it
+	// wants the jitter-resolved frame, so the mode it really needs underneath is
+	// AA_MODE_UPSCALE. The pin at the bottom of this function then holds TAAU to
+	// 1:1 and leaves the actual upscaling to the network.
+	bool nss_selected = (flt_taa == AA_MODE_NSS);
+	if (nss_selected)
+	{
+		flt_taa = AA_MODE_UPSCALE;
+	}
+
 	if (flt_taa == AA_MODE_TAA)
 	{
 		qvk.effective_aa_mode = AA_MODE_TAA;
 	}
 	else if (flt_taa == AA_MODE_UPSCALE) // TAAU or TAA+FSR
 	{
-		if (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height)
+		// Normally dropping to plain TAA here is right, because the render
+		// extent already meets or exceeds the display so there is nothing to
+		// upsample. NSS is exempt: its render extent is the model's fixed one
+		// rather than a viewsize/DRS choice, so in a window smaller than that
+		// this would silently disable the jitter the network reconstructs from.
+		if (!nss_selected
+			&& (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height))
 		{
 			qvk.effective_aa_mode = AA_MODE_TAA;
 		}
@@ -2655,6 +2692,12 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 				qvk.extent_taa_output = qvk.extent_unscaled;
 		}
 	}
+
+	// nss_pack.comp reads TEX_TAA_OUTPUT at the model's fixed extent, so nothing
+	// upstream may upsample first: the two have to stay equal. Unconditional and
+	// last, so it also overrides the extent_unscaled pin above.
+	if (upscaler_active_this_frame())
+		qvk.extent_taa_output = qvk.extent_render;
 }
 
 static void
@@ -2854,9 +2897,15 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
 	}
 	else if(fsr_enabled || (qvk.effective_aa_mode == AA_MODE_UPSCALE))
 	{
-		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100
-		float resolution_scale = (drs_effective_scale != 0) ? (float)drs_effective_scale : (float)scr_viewsize->integer;
-		resolution_scale *= 0.01f;
+		// adjust texture LOD bias to the resolution scale, i.e. use negative bias if scale is < 100.
+		// Taken from the extents that were actually used rather than from viewsize: NSS pins the
+		// render extent to its model's fixed shape, so viewsize/DRS no longer describe it. For
+		// every other path the two are the same value.
+		//
+		// NSS deliberately lands here rather than in a branch of its own. It is a temporal
+		// accumulator like TAAU -- it reconstructs from jittered history -- so the extra texture
+		// detail a negative bias exposes is exactly what it is meant to resolve.
+		float resolution_scale = (float)qvk.extent_render.width / (float)qvk.extent_unscaled.width;
 		resolution_scale = Q_clipf(resolution_scale, 0.1f, 1.f);
 		ubo->pt_texture_lod_bias = cvar_pt_texture_lod_bias->value + log2f(resolution_scale);
 	}
@@ -3195,17 +3244,17 @@ R_RenderFrame_RTX(refdef_t *fd)
 	{
 		VkCommandBuffer lines_cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
 
-		if (qvkCmdBeginDebugUtilsLabelEXT != NULL)
+		if (vkCmdBeginDebugUtilsLabelEXT != NULL)
 		{
 			const VkDebugUtilsLabelEXT label = {
 				.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
 				.pLabelName = "debug lines"
 			};
-			qvkCmdBeginDebugUtilsLabelEXT(lines_cmd_buf, &label);
+			vkCmdBeginDebugUtilsLabelEXT(lines_cmd_buf, &label);
 		}
 		vkpt_debugdraw_draw(lines_cmd_buf);
-		if (qvkCmdEndDebugUtilsLabelEXT != NULL)
-			qvkCmdEndDebugUtilsLabelEXT(lines_cmd_buf);
+		if (vkCmdEndDebugUtilsLabelEXT != NULL)
+			vkCmdEndDebugUtilsLabelEXT(lines_cmd_buf);
 
 		vkpt_submit_command_buffer_simple(lines_cmd_buf, qvk.queue_graphics, false);
 	}
@@ -3310,8 +3359,13 @@ R_RenderFrame_RTX(refdef_t *fd)
 		}
 		END_PERF_MARKER(post_cmd_buf, PROFILER_TONE_MAPPING);
 
-		// Skip FSR (upscaling) if image is going to be heavily blurred anyway (menu mode)
-		if(vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
+		// Skip FSR/NPU upscaling if image is going to be heavily blurred anyway (menu mode).
+		// The two are mutually exclusive alternatives for the same upscale-to-display-res step.
+		if (upscaler_active_this_frame() && !qvk.frame_menu_mode)
+		{
+			vkpt_upscaler_do(post_cmd_buf);
+		}
+		else if(vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
 		{
 			vkpt_fsr_do(post_cmd_buf);
 		}
@@ -3321,9 +3375,15 @@ R_RenderFrame_RTX(refdef_t *fd)
 			vkCmdCopyBuffer(post_cmd_buf, qvk.buf_readback.buffer, qvk.buf_readback_staging[qvk.current_frame_index].buffer, 1, &copyRegion);
 		}
 
-		_VK(vkpt_profiler_query(post_cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
-
+		// The PROFILER_FRAME_TIME stop deliberately does not go here: the final
+		// blit, and with the NPU upscaler the queue drain and the reconstruct
+		// pass, are all still ahead. R_EndFrame_RTX() closes the query instead.
 		vkpt_submit_command_buffer_simple(post_cmd_buf, qvk.queue_graphics, true);
+
+		// The NPU runs on the CPU's side of the fence: the pack dispatch above
+		// has to complete before the tensor can be read, and the reconstruct pass
+		// in vkpt_upscaler_final_blit() needs the result. Hence a stall here.
+		vkpt_upscaler_run_inference();
 	}
 
 	temporal_frame_valid = ref_mode.enable_denoiser;
@@ -3505,13 +3565,32 @@ R_BeginFrame_RTX(void)
 	}
 
 	drs_process();
-	if (vkpt_refdef.fd)
+
+	VkExtent2D extent_render = get_render_extent();
+
+	// Toggling the NPU upscaler changes the render extent by the model's whole
+	// scale factor in one frame, which DRS never does. The tone curve and the
+	// adapted luminance live in the persistent qvk.buf_tonemap and blend towards
+	// the new frame over tm_exposure_speed_* seconds, so a histogram gathered
+	// over the old rect would otherwise drive the exposure for a visible while
+	// after the switch. Reset rather than adapt.
+	if (!extents_equal(extent_render, qvk.extent_render))
 	{
-		vkpt_refdef.fd->feedback.resolution_scale = (drs_effective_scale != 0) ? drs_effective_scale : scr_viewsize->integer;
+		vkpt_tone_mapping_request_reset();
+		vkpt_reset_accumulation();
 	}
 
-	qvk.extent_render = get_render_extent();
+	qvk.extent_render = extent_render;
 	qvk.gpu_slice_width = (qvk.extent_render.width + qvk.device_count - 1) / qvk.device_count;
+
+	if (vkpt_refdef.fd && qvk.extent_unscaled.width)
+	{
+		// Report the scale that was actually rendered at rather than the one that
+		// was asked for; the NPU upscaler overrides both viewsize and DRS, and
+		// this is what scr_fps and cl_resolution_scale show the user.
+		vkpt_refdef.fd->feedback.resolution_scale =
+			qvk.extent_render.width * 100 / qvk.extent_unscaled.width;
+	}
 	
 	VkExtent2D extent_screen_images = get_screen_image_extent();
 
@@ -3599,13 +3678,23 @@ R_EndFrame_RTX(void)
 	if (frame_ready)
 	{
 		bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
-		if (vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
+		if (upscaler_active_this_frame() && !qvk.frame_menu_mode)
+		{
+			vkpt_upscaler_final_blit(cmd_buf, waterwarp);
+		}
+		else if (vkpt_fsr_is_enabled() && !qvk.frame_menu_mode)
 		{
 			vkpt_fsr_final_blit(cmd_buf, waterwarp);
 		}
 		else if (qvk.effective_aa_mode == AA_MODE_UPSCALE)
 		{
-			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, false, waterwarp);
+			// TAAU normally lands this at display resolution, so an unfiltered
+			// blit is a 1:1 copy. It does not when the NPU upscaler has pinned
+			// extent_taa_output to the render extent and then sits out the frame
+			// (menu mode), which would otherwise leave a nearest-neighbour
+			// upscale of the render-resolution image.
+			bool needs_filter = !extents_equal(qvk.extent_taa_output, qvk.extent_unscaled);
+			vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, needs_filter, waterwarp);
 		}
 		else
 		{
@@ -3619,6 +3708,11 @@ R_EndFrame_RTX(void)
 			else
 				vkpt_final_blit(cmd_buf, VKPT_IMG_TAA_OUTPUT, qvk.extent_taa_output, true, waterwarp);
 		}
+
+		// Closes the query opened in the trace command buffer. frame_ready is
+		// set unconditionally at the end of the render path, so it is true
+		// exactly when the matching PROFILER_START was written this frame.
+		_VK(vkpt_profiler_query(cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
 
 		frame_ready = false;
 	}
@@ -3853,6 +3947,8 @@ R_Init_RTX(bool total)
 
 	drs_init();
 	vkpt_fsr_init_cvars();
+	// vkpt_upscaler_init_cvars() is deliberately not here next to the other two:
+	// it hooks flt_taa, which the UBO_CVAR_LIST block below is what registers.
 
 	// Minimum NVIDIA driver version - this is a cvar in case something changes in the future,
 	// and the current test no longer works.
@@ -3883,6 +3979,10 @@ R_Init_RTX(bool total)
 #define UBO_CVAR_DO(name, default_value) cvar_##name = Cvar_Get(#name, #default_value, 0);
 	UBO_CVAR_LIST
 #undef UBO_CVAR_LIST
+
+	// Needs cvar_flt_taa (registered just above) and cvar_flt_fsr_enable (from
+	// vkpt_fsr_init_cvars, further up), because it multiplexes both.
+	vkpt_upscaler_init_cvars();
 
 	cvar_flt_temporal_hf->changed = temporal_cvar_changed;
 	cvar_flt_temporal_lf->changed = temporal_cvar_changed;

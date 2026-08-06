@@ -1,0 +1,4 @@
+# The Dockerfile only needs docker-entrypoint.sh in the build context.
+# Keep the context tiny (the committed q2rtx/q2rtxded binaries alone are ~40 MB).
+*
+!docker-entrypoint.sh

@@ -736,7 +736,52 @@ Red channel shows low-frequency (GI) gradients, green channel shows direct diffu
 and blue channel shows direct specular gradients. Default value is 0.
 
 #### `flt_taa`
-Enables temporal anti-aliasing and primary ray direction jitter. Default value is 1.
+Selects the temporal reconstruction mode, and enables primary ray direction jitter.
+Default value is 1.
+
+| Value | Mode |
+| ----- | ---- |
+| 0     | off |
+| 1     | temporal AA |
+| 2     | temporal upscaling (TAAU) |
+| 3     | NSS Temporal (NPU) — see [`flt_nss_enable`](#flt_nss_enable) |
+
+Value 3 is the menu-facing selector for the NSS temporal upscaler; it is available
+only in a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64). Elsewhere it is
+still selectable and simply does nothing.
+
+#### `flt_nss_enable`
+Enables Arm's Neural Super Sampling temporal upscaler, which runs on the Hexagon NPU
+through ONNX Runtime's Qualcomm QNN execution provider. Default value is 0.
+
+This is the authoritative on/off switch and the one that persists; `flt_taa 3` drives
+it from the menu. Setting either reloads the ONNX Runtime session, which takes a few
+seconds because the QNN execution provider finalizes the HTP graph.
+
+NSS is not an alternative to temporal AA but a consumer of it: it reads the
+jitter-resolved, tone-mapped TAA output, applies a per-pixel kernel-prediction filter
+and a learned temporal blend, and reconstructs at exactly 2× the render extent.
+
+**It pins the render resolution.** The model was exported at a single fixed input
+shape and cannot tile or crop, so while it is loaded `viewsize` and the dynamic
+resolution scaling cvars have no effect — the render extent is the model's, and the
+result is stretched to whatever the display is. Enabling it also turns
+[`flt_fsr_enable`](#flt_fsr_enable) off, since both want to be the stage that
+resolves to display resolution.
+
+#### `flt_upscaler_verbose`
+Raises ONNX Runtime logging to verbose, which is where per-node execution-provider
+assignment is reported. That assignment is how you confirm the model really runs on
+the NPU rather than silently falling back to the CPU. Default value is 0.
+
+Read once, when the ONNX Runtime environment is created, so it must be set *before*
+the model loads — `set flt_upscaler_verbose 1` and then restart, rather than toggling
+it during play. Not archived.
+
+#### `upscaler_dump`
+Console command. Dumps the NSS input tensor's reprojected-history and current-colour
+channels, and the post-inference temporal blend parameters, for the next rendered
+frame as PNGs under `<gamedir>/screenshots/upscaler/`.
 
 #### `flt_fsr_enable`
 Enables FidelityFX Super Resolution 1.0 ("AMD FSR 1.0") upscaling. Default value is 0.

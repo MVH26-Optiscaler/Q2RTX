@@ -45,6 +45,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #define AA_MODE_OFF 0
 #define AA_MODE_TAA 1
 #define AA_MODE_UPSCALE 2
+// CPU-side menu selector only, never an effective mode: evaluate_taa_settings()
+// folds it into AA_MODE_UPSCALE before qvk.effective_aa_mode is assigned, and
+// only that reaches ubo->flt_taa. No shader ever sees this value.
+#define AA_MODE_NSS 3
 
 // Scaling factors for lighting components when they are stored in textures.
 // FP16 and RGBE textures have very limited range, and these factors help bring the signal within that range.

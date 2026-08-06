@@ -156,6 +156,27 @@ Note: Linux ppc64le is also known to work though not officially supported.
 
      `cmake --build . `
 
+### Windows on ARM64 (Snapdragon)
+
+ARM64 builds enable the NSS temporal NPU upscaler by default (`USE_ORT_QNN_UPSCALER`,
+see [`flt_nss_enable`](doc/client.md#flt_nss_enable)). CMake fetches ONNX Runtime with the
+Qualcomm QNN execution provider from NuGet and copies its runtime DLLs next to
+`client.exe`, so no system-wide QAIRT SDK install is needed. Pass
+`-DUSE_ORT_QNN_UPSCALER=OFF` to build without it.
+
+The Vulkan loader needs no special handling: the client resolves every Vulkan entry
+point at runtime through the vendored [volk](https://github.com/zeux/volk) meta-loader,
+so nothing links an import library and no ARM64 `vulkan-1.lib` is required.
+
+One extra step is needed on ARM64:
+
+  1. **spirv-opt.** The unoptimized ray-query compute variants of the path tracer shaders
+     exceed the Adreno shader compiler's size limit, and `vkCreateComputePipelines` fails
+     with `VK_ERROR_UNKNOWN` ("Couldn't initialize pt"). The build runs `spirv-opt -Os` on
+     them, which requires the [Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) to be
+     installed (or `-DSPIRV_OPT_COMMAND=<path>`). CMake warns at configure time if it
+     cannot find one.
+
 ## Music Playback Support
 
 Quake II RTX supports music playback from OGG files, if they can be located. To enable music playback, copy the CD tracks into a `music` folder either next to the executable, or inside the game directory, such as `baseq2/music`. The files should use one of these two naming schemes:
