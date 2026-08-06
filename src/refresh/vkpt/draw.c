@@ -751,9 +751,18 @@ vkpt_draw_submit_stretch_pics(VkCommandBuffer cmd_buf)
 VkResult
 vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D extent, bool filtered, bool warped)
 {
+	return vkpt_final_blit_view(cmd_buf, qvk.images_views[image_index], extent, filtered, warped);
+}
+
+// Same, for an image that is not one of the screen images. The NPU upscaler owns
+// its output image rather than taking a VKPT_IMG_* slot, because at viewsize 100
+// with a 4x model it is four times the extent get_screen_image_extent() allocates.
+VkResult
+vkpt_final_blit_view(VkCommandBuffer cmd_buf, VkImageView image_view, VkExtent2D extent, bool filtered, bool warped)
+{
 	VkDescriptorImageInfo img_info_input = {
 		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-		.imageView   = qvk.images_views[image_index],
+		.imageView   = image_view,
 		.sampler     = qvk.tex_sampler,
 	};
 	VkImageView debug_lines_view = vpkt_debugdraw_imageview();

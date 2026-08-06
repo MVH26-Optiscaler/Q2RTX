@@ -122,7 +122,13 @@ main()
         uv = clamp(uv, 0.5 * input_dim_inv, vec2(1) - 1.5 * input_dim_inv);
     }
 
-    uv *= push.input_dimensions / vec2(global_ubo.taa_image_width, global_ubo.taa_image_height);
+    // input_dimensions is the sub-rect of the source that actually holds the
+    // frame; the rest of the allocation is slack. Normalizing by the image's own
+    // size rather than by taa_image_* is what lets an image that is not one of
+    // the screen images be blitted -- the NPU upscaler's output is allocated at
+    // exactly its own extent, which at viewsize 100 with a 4x model is four
+    // times the screen images.
+    uv *= push.input_dimensions / vec2(textureSize(final_blit_input_image, 0));
 
     vec3 color;
     if(spec_final_blit_filter_lanczos != 0)

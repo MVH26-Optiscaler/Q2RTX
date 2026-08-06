@@ -59,9 +59,5 @@ baseq2/**/*.txt
 # "baseq2/models/" would ignore the directory itself, and git cannot un-ignore a
 # file inside an ignored directory.
 baseq2/models/*
-!baseq2/models/quicksrnetsmall-w8a8.onnx
-!baseq2/models/quicksrnetsmall.data
-!baseq2/models/quicksrnetlarge-w8a8.onnx
-!baseq2/models/quicksrnetlarge.data
-!baseq2/models/quicksrnetlarge-w8a8.metadata.json
-!baseq2/models/quicksrnetlarge-q2rtx-w8a8.onnx
+!baseq2/models/quicksrnetlarge-2x-rgba-w8a8.onnx
+!baseq2/models/quicksrnetlarge-4x-rgba-w8a8.onnx

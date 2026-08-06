@@ -333,8 +333,6 @@ set(SRC_SHADERS
 	refresh/vkpt/shader/fsr_easu_fp32.comp
 	refresh/vkpt/shader/fsr_rcas_fp16.comp
 	refresh/vkpt/shader/fsr_rcas_fp32.comp
-	refresh/vkpt/shader/upscaler_pack.comp
-	refresh/vkpt/shader/upscaler_unpack.comp
 	refresh/vkpt/shader/debug_line.frag
 	refresh/vkpt/shader/debug_line.vert
 )

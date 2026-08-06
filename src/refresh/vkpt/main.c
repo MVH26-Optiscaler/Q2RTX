@@ -2677,12 +2677,11 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 		}
 	}
 
-	// The NPU upscaler packs the TAA output into its tile grid 1:1, so nothing
-	// upstream may upsample first: the tile grid is sized from the render extent
-	// and the unpack pass derives its source rect from extent_taa_output, so the
-	// two have to stay equal. Unconditional and last: it has to hold whatever
-	// flt_taa says, and even if FSR was also switched on behind flt_upscaling's
-	// back.
+	// The NPU upscaler copies the TAA output into its input tensor 1:1, so
+	// nothing upstream may upsample first: its ONNX Runtime session is built for
+	// exactly extent_taa_output, and every extent change costs a session rebuild.
+	// Unconditional and last: it has to hold whatever flt_taa says, and even if
+	// FSR was also switched on behind flt_upscaling's back.
 	if (upscaler_active_this_frame())
 		qvk.extent_taa_output = qvk.extent_render;
 }
@@ -3377,12 +3376,12 @@ R_RenderFrame_RTX(refdef_t *fd)
 
 		_VK(vkpt_profiler_query(post_cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
 
-		// Signals the spatial upscaler's pack fence when the pack dispatch above
-		// went into this command buffer, so next frame's inference can tell the
-		// tensor is ready without draining the queue. VK_NULL_HANDLE otherwise,
-		// which is exactly what vkpt_submit_command_buffer_simple() would pass.
+		// Signals the NPU upscaler's download fence when the transfer above went
+		// into this command buffer, so next frame's inference can tell the tensor
+		// is ready without draining the queue. VK_NULL_HANDLE otherwise, which is
+		// exactly what vkpt_submit_command_buffer_simple() would pass.
 		vkpt_submit_command_buffer(post_cmd_buf, qvk.queue_graphics, (1 << qvk.device_count) - 1,
-			0, NULL, NULL, NULL, 0, NULL, NULL, vkpt_upscaler_pack_fence());
+			0, NULL, NULL, NULL, 0, NULL, NULL, vkpt_upscaler_download_fence());
 	}
 
 	temporal_frame_valid = ref_mode.enable_denoiser;
@@ -3676,11 +3675,11 @@ R_EndFrame_RTX(void)
 
 	bool upscaler_blits_this_frame = frame_ready && upscaler_active_this_frame() && !qvk.frame_menu_mode;
 
-	// The NPU upscaler's round trip spans two frames, and its unpack lives in the
+	// The NPU upscaler's round trip spans two frames, and its upload lives in the
 	// blit below. On any frame that does not reach that blit nothing will consume
-	// what it packed, so drop it: a tensor left pending would otherwise resurface
-	// a frame late, possibly after its staging buffers were rebuilt at a
-	// different tile grid.
+	// what it downloaded, so drop it: a tensor left pending would otherwise
+	// resurface a frame late, possibly after its staging buffers were rebuilt at
+	// a different extent.
 	if (!upscaler_blits_this_frame)
 		vkpt_upscaler_discard();
 

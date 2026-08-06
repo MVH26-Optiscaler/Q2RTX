@@ -2,4 +2,3 @@
 # them explicitly keeps git from applying end-of-line normalization or trying to
 # diff them, regardless of the checkout's core.autocrlf setting.
 *.onnx binary
-*.data binary

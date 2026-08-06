@@ -16,11 +16,11 @@
         asset render as an opaque black silhouette - black HUD icons, ammo/health
         digits and crosshairs - while PNG/TGA-overridden assets look fine.
 
-      * An ONNX upscaler model whose external-data file is misnamed. The .onnx
-        references its weights by filename - quicksrnetsmall.data - so a model
-        re-fetched or hand-placed outside the committed set easily ends up with its
-        weights saved as quicksrnetsmall-w8a8.data instead. The model then loads but
-        its weights do not.
+      * An ONNX upscaler model with NCHW graph I/O. upscaler.c copies pixels
+        straight into the input tensor with no shader in between, which only works
+        because the models declare uint8 NHWC RGBA I/O. A model taken from the
+        training pipeline without running scripts\onnx-nhwc-io.py over it loads and
+        runs and renders horizontal colour bands instead of an image.
 
       * Missing ONNX Runtime / QNN runtime DLLs next to q2rtx.exe, or an exe built
         for the wrong architecture.
@@ -40,33 +40,16 @@
 
 .PARAMETER UpscalerModel
     Path to an NPU upscaler model - either the .onnx itself or a directory holding it.
-    Staged into baseq2\models along with the external-data file it references, under
-    whatever name the model asks for.
+    Staged into baseq2\models under its own name.
 
-    The models are NOT part of the game and are never taken from the game install. All
-    four ship in the repo under baseq2\models, so you normally need neither this
-    parameter nor -WithUpscalerModel; use this one to try a model built elsewhere.
-    Models already in baseq2\models are validated either way, and an absent one is
-    reported as a warning rather than an error - everything except the matching
-    upscaler setting works without it.
+    The models are NOT part of the game and are never taken from the game install. Both
+    ship in the repo under baseq2\models, so you normally do not need this parameter;
+    use it to try a model built elsewhere. Whatever ends up in baseq2\models is
+    validated either way, and an absent model is reported as a warning rather than an
+    error - everything except the matching upscaler setting works without it.
 
-.PARAMETER WithUpscalerModel
-    Re-download the two Qualcomm AI Hub models - QuickSRNetSmall (flt_upscaling 2) and
-    QuickSRNetLarge (flt_upscaling 3), onnx-w8a8 - into baseq2\models, verifying a
-    pinned sha256 for each. Since both are committed to the repo this is only a repair
-    path; `git checkout -- baseq2/models` does the same thing faster. Counterpart to
-    deploy-assets.sh --with-upscaler-model, from the same pinned qai-hub-models release;
-    that script fetches the TFLite variants because it targets USE_LITE_RT, while
-    upscaler.c on this branch loads ONNX.
-
-    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) is skipped: it has no upstream
-    zip to fetch (it is fine-tuned locally), so the repo is its only source.
-
-    Note the rename asymmetry, which is what makes this fiddly to do by hand: each zip
-    ships e.g. quicksrnetsmall.onnx + quicksrnetsmall.data, and the model must be
-    renamed to quicksrnetsmall-w8a8.onnx (what upscaler.c loads) while the .data must
-    keep its name (the .onnx references it by that name). Renaming both by variant
-    produces a model that loads but has no weights.
+    A model straight out of the training pipeline needs converting first:
+        python scripts\onnx-nhwc-io.py trained.onnx converted.onnx --verify
 
 .PARAMETER Fix
     Apply repairs instead of only reporting: park a shadowing/corrupt pics\colormap.pcx
@@ -84,11 +67,6 @@
     Don't stage anything; just check the current baseq2\ and repair what's repairable.
 
 .EXAMPLE
-    .\scripts\deploy-assets.ps1 -WithUpscalerModel
-    Stage assets and re-download the AI Hub upscaler models, if they were deleted from
-    baseq2\models.
-
-.EXAMPLE
     .\scripts\deploy-assets.ps1 -GameDir "D:\Games\Quake II RTX" -Mode Copy -UpscalerModel .\models
     Self-contained staging from a non-default install, taking the model from a local path.
 #>
@@ -98,7 +76,6 @@ param(
     [ValidateSet("Link", "Copy")]
     [string]$Mode = "Link",
     [string]$UpscalerModel = "",
-    [switch]$WithUpscalerModel,
     [switch]$Fix,
     [switch]$VerifyOnly
 )
@@ -108,42 +85,27 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) -Parent
 $Baseq2   = Join-Path $RepoRoot "baseq2"
 
-# The NPU upscaler models. All three are committed under baseq2\models, so a
-# fresh clone already has them; the download path below only exists to restore
-# the two AI Hub ones if they get deleted.
+# The NPU upscaler models. Both are committed under baseq2\models, so a fresh
+# clone already has them, and neither has an upstream to fetch from: they are
+# QuickSRNet Large fine-tuned locally on Quake II RTX frames, then re-exported
+# with uint8 NHWC RGBA I/O by scripts\onnx-nhwc-io.py. The repo is their only
+# source, so `git checkout -- baseq2/models` is the repair path.
 #
-# The AI Hub entries are pinned to the same qai-hub-models release
-# deploy-assets.sh uses. That script fetches the TFLite variants; upscaler.c
-# loads ONNX, so we take the onnx-w8a8 zips from the same base URL. The
-# checksums guard against a mismatched or compromised download, exactly as in
-# deploy-assets.sh. Bundled entries have no upstream to fetch from: the
-# Q2RTX-tuned model is produced locally, not published, so the repo is its only
-# source.
+# They are also self-contained - unlike the stock AI Hub builds this branch used
+# to ship, they carry their weights inline rather than in a .data sidecar, which
+# is why there is no external-data handling here any more.
 #
 # Onnx is the filename upscaler.c loads relative to the game dir and Selector is the
 # console setting that picks it; both come from upscaler_models[] in
 # src/refresh/vkpt/upscaler.c and must stay in step with it.
-$QaiHubBaseUrl  = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/{0}/releases/v0.57.3"
 $UpscalerModels = @(
     @{
-        Id       = "quicksrnetsmall"
-        Zip      = "quicksrnetsmall-onnx-w8a8.zip"
-        Sha      = "22a62639f0523dee0b1e492f86785a9d27a70f1225894b096941d6a662d5968f"
-        Onnx     = "quicksrnetsmall-w8a8.onnx"
+        Onnx     = "quicksrnetlarge-2x-rgba-w8a8.onnx"
         Selector = "flt_upscaling 2"
     },
     @{
-        Id       = "quicksrnetlarge"
-        Zip      = "quicksrnetlarge-onnx-w8a8.zip"
-        Sha      = "7aafb97849a90844028fd862537f8c8ff27aafef89a034939daa0e4d5f656f42"
-        Onnx     = "quicksrnetlarge-w8a8.onnx"
+        Onnx     = "quicksrnetlarge-4x-rgba-w8a8.onnx"
         Selector = "flt_upscaling 3"
-    },
-    @{
-        Id       = "quicksrnetlarge-q2rtx"
-        Onnx     = "quicksrnetlarge-q2rtx-w8a8.onnx"
-        Selector = "flt_upscaling 4"
-        Bundled  = $true
     }
 )
 
@@ -269,67 +231,6 @@ function Invoke-Stage([string]$SourceBaseq2) {
     }
 }
 
-# Mirrors fetch_model_variant() in deploy-assets.sh: download, verify the pinned
-# sha256, extract into baseq2\models. Runs for every entry in $UpscalerModels;
-# the two models reference differently named .data files, so they coexist.
-function Invoke-FetchModel {
-    Write-Head "Fetching upscaler models from Qualcomm AI Hub"
-    $modelsDir = Join-Path $Baseq2 "models"
-    if (-not (Test-Path -LiteralPath $modelsDir)) { $null = New-Item -ItemType Directory -Path $modelsDir }
-
-    foreach ($m in $UpscalerModels) {
-        if ($m.Bundled) { Write-Item "skip  $($m.Onnx) (ships in the repo; nothing to download)"; continue }
-
-        $dest = Join-Path $modelsDir $m.Onnx
-        if (Test-Path -LiteralPath $dest) { Write-Item "keep  $($m.Onnx) (already present, not re-downloading)"; continue }
-
-        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("q2rtx-model-" + [System.Guid]::NewGuid().ToString("N"))
-        $null = New-Item -ItemType Directory -Path $tmp
-        try {
-            $zip = Join-Path $tmp $m.Zip
-            Write-Item "fetch $($m.Zip)"
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri "$($QaiHubBaseUrl -f $m.Id)/$($m.Zip)" -OutFile $zip -UseBasicParsing
-
-            $got = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($got -ne $m.Sha) {
-                Add-Problem "checksum mismatch for $($m.Zip) (expected $($m.Sha), got $got)"
-                continue
-            }
-            Write-Item "verify sha256 ok"
-
-            Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $tmp "x") -Force
-            $onnx = Get-ChildItem -LiteralPath (Join-Path $tmp "x") -Recurse -Filter "*.onnx" -File | Select-Object -First 1
-            if (-not $onnx) { Add-Problem "no .onnx inside $($m.Zip)"; continue }
-
-            # The zip ships the model as e.g. quicksrnetsmall.onnx; upscaler.c loads it
-            # under a variant-qualified name, so rename on the way in - the same thing
-            # deploy-assets.sh does for the TFLite variants.
-            Copy-Item -LiteralPath $onnx.FullName -Destination $dest -Force
-            Write-Item "stage $($onnx.Name) -> $($m.Onnx)"
-
-            # The weights are referenced BY NAME from inside the .onnx, so unlike the model
-            # itself they must keep the name the zip ships them under. Renaming these by
-            # variant is exactly what leaves the model loadable but its weights missing.
-            foreach ($ref in Get-OnnxExternalData $dest) {
-                $src = Get-ChildItem -LiteralPath (Join-Path $tmp "x") -Recurse -Filter $ref -File | Select-Object -First 1
-                if (-not $src) { Add-Problem "$($m.Onnx) references '$ref' but the zip does not contain it"; continue }
-                Copy-Item -LiteralPath $src.FullName -Destination (Join-Path $modelsDir $ref) -Force
-                Write-Item "stage $ref (name preserved - the model references it by this name)"
-            }
-
-            $meta = Get-ChildItem -LiteralPath (Join-Path $tmp "x") -Recurse -Filter "metadata.json" -File | Select-Object -First 1
-            if ($meta) {
-                $metaName = [System.IO.Path]::GetFileNameWithoutExtension($m.Onnx) + ".metadata.json"
-                Copy-Item -LiteralPath $meta.FullName -Destination (Join-Path $modelsDir $metaName) -Force
-                Write-Item "stage metadata.json -> $metaName"
-            }
-        } finally {
-            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
-        }
-    }
-}
-
 function Invoke-StageModel([string]$ModelPath) {
     Write-Head "Staging upscaler model"
     $onnx = $null
@@ -345,24 +246,6 @@ function Invoke-StageModel([string]$ModelPath) {
 
     Copy-Item -LiteralPath $onnx.FullName -Destination (Join-Path $modelsDir $onnx.Name) -Force
     Write-Item "copy  $($onnx.Name)"
-
-    # The .onnx names its weights file internally; stage it under the name the
-    # model actually asks for, regardless of what it is called at the source.
-    foreach ($ref in Get-OnnxExternalData $onnx.FullName) {
-        $cand = Get-ChildItem -LiteralPath $onnx.DirectoryName -Filter "*.data" -File
-        if (-not $cand) { Add-Problem "$($onnx.Name) references '$ref' but no .data file exists beside it"; continue }
-        $pick = $cand | Where-Object { $_.Name -eq $ref } | Select-Object -First 1
-        if (-not $pick) { $pick = $cand | Select-Object -First 1 }
-        Copy-Item -LiteralPath $pick.FullName -Destination (Join-Path $modelsDir $ref) -Force
-        if ($pick.Name -ne $ref) { Write-Item "copy  $($pick.Name) -> $ref (renamed to the name the model references)" }
-        else { Write-Item "copy  $ref" }
-    }
-}
-
-# Returns the external-data filenames referenced inside an .onnx protobuf.
-function Get-OnnxExternalData([string]$OnnxPath) {
-    $txt = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($OnnxPath))
-    return [regex]::Matches($txt, '[A-Za-z0-9_\-\.]+\.data') | ForEach-Object { $_.Value } | Sort-Object -Unique
 }
 
 # ---------------------------------------------------------------------------
@@ -428,56 +311,28 @@ function Test-UpscalerModel {
     Write-Head "NPU upscaler models"
     $modelsDir = Join-Path $Baseq2 "models"
     if (-not (Test-Path -LiteralPath $modelsDir -PathType Container)) {
-        Add-Warning "baseq2\models is absent; no NPU upscaler will be available (re-run with -WithUpscalerModel)"
+        Add-Warning "baseq2\models is absent; no NPU upscaler will be available (restore it with: git checkout -- baseq2/models)"
         return
-    }
-
-    # Every weights name any present model asks for. A .data file outside this
-    # set is an orphan and is the only thing safe to rename onto a missing ref -
-    # with two models staged, grabbing "the first .data" could hand one model the
-    # other one's weights.
-    $claimed = @{}
-    foreach ($m in $UpscalerModels) {
-        $p = Join-Path $modelsDir $m.Onnx
-        if (Test-Path -LiteralPath $p) { foreach ($r in Get-OnnxExternalData $p) { $claimed[$r] = $true } }
     }
 
     foreach ($m in $UpscalerModels) {
         $onnx = Join-Path $modelsDir $m.Onnx
         if (-not (Test-Path -LiteralPath $onnx)) {
-            # The repo is the only source for a bundled model, so pointing at
-            # -WithUpscalerModel would send you looking for a download that does
-            # not exist.
-            $how = "re-run with -WithUpscalerModel"
-            if ($m.Bundled) { $how = "restore it with: git checkout -- baseq2/models" }
-            Add-Warning "baseq2\models\$($m.Onnx) is absent; $($m.Selector) will be unavailable ($how)"
+            Add-Warning "baseq2\models\$($m.Onnx) is absent; $($m.Selector) will be unavailable (restore it with: git checkout -- baseq2/models)"
             continue
         }
-        Write-Ok "$($m.Onnx) present"
 
-        foreach ($ref in Get-OnnxExternalData $onnx) {
-            $refPath = Join-Path $modelsDir $ref
-            if (Test-Path -LiteralPath $refPath) { Write-Ok "external data '$ref' present"; continue }
-
-            # The model asks for its weights by name. Installs that ship the file under
-            # a different name leave the model unable to load them.
-            $alt = Get-ChildItem -LiteralPath $modelsDir -Filter "*.data" -File |
-                Where-Object { -not $claimed.ContainsKey($_.Name) } | Select-Object -First 1
-            if (-not $alt) {
-                Add-Problem "$($m.Onnx) references external data '$ref' but no unclaimed .data file is present"
-                continue
-            }
-
-            $msg = "$($m.Onnx) references '$ref' but the file present is named '$($alt.Name)'"
-            Add-Problem $msg
-            if ($Fix) {
-                Copy-Item -LiteralPath $alt.FullName -Destination $refPath -Force
-                Add-Repair "copied $($alt.Name) -> $ref"
-                Resolve-Problem $msg
-            } else {
-                Write-Item "      -> re-run with -Fix to copy it to the expected name"
-            }
+        # The whole transfer path assumes uint8 NHWC RGBA I/O, and an NCHW model
+        # loads and runs and renders colour bands rather than an image. upscaler.c
+        # rejects one at load, but catching it here names the fix. The marker is
+        # the name onnx-nhwc-io.py gives the input transpose it inserts.
+        $txt = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($onnx))
+        if ($txt -notmatch 'nhwc_to_nchw_in') {
+            Add-Problem "$($m.Onnx) has NCHW graph I/O; convert it with: python scripts\onnx-nhwc-io.py <in>.onnx baseq2\models\$($m.Onnx)"
+            continue
         }
+
+        Write-Ok "$($m.Onnx) present, NHWC RGBA I/O"
     }
 }
 
@@ -523,7 +378,6 @@ if (-not $VerifyOnly) {
     }
     Invoke-Stage $srcBaseq2
     if ($UpscalerModel) { Invoke-StageModel $UpscalerModel }
-    if ($WithUpscalerModel) { Invoke-FetchModel }
 } else {
     Write-Head "Verify only - nothing will be staged"
 }

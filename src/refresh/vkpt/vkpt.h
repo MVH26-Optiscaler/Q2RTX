@@ -100,8 +100,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	SHADER_MODULE_DO(QVK_MOD_FSR_EASU_FP32_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP16_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP32_COMP)                     \
-	SHADER_MODULE_DO(QVK_MOD_UPSCALER_PACK_COMP)                     \
-	SHADER_MODULE_DO(QVK_MOD_UPSCALER_UNPACK_COMP)                   \
 	SHADER_MODULE_DO(QVK_MOD_NORMALIZE_NORMAL_MAP_COMP)              \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_FRAG)                        \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_VERT)                        \
@@ -497,8 +495,8 @@ void create_orthographic_matrix(mat4_t matrix, float xmin, float xmax,
 	PROFILER_DO(FSR_EASU,                   2) \
 	PROFILER_DO(FSR_RCAS,                   2) \
 	PROFILER_DO(UPSCALER,                   1) \
-	PROFILER_DO(UPSCALER_PACK,              2) \
-	PROFILER_DO(UPSCALER_UNPACK,            2) \
+	PROFILER_DO(UPSCALER_DOWNLOAD,          2) \
+	PROFILER_DO(UPSCALER_UPLOAD,            2) \
 	PROFILER_DO(UPDATE_ENVIRONMENT,         1) \
 	PROFILER_DO(GOD_RAYS,                   1) \
 	PROFILER_DO(GOD_RAYS_REFLECT_REFRACT,   1) \
@@ -618,6 +616,7 @@ VkResult vkpt_draw_destroy_pipelines(void);
 VkResult vkpt_draw_create_pipelines(void);
 VkResult vkpt_draw_submit_stretch_pics(VkCommandBuffer cmd_buf);
 VkResult vkpt_final_blit(VkCommandBuffer cmd_buf, unsigned int image_index, VkExtent2D extent, bool filtered, bool warped);
+VkResult vkpt_final_blit_view(VkCommandBuffer cmd_buf, VkImageView image_view, VkExtent2D extent, bool filtered, bool warped);
 VkResult vkpt_draw_clear_stretch_pics(void);
 
 VkResult vkpt_uniform_buffer_create(void);
@@ -716,12 +715,12 @@ bool vkpt_upscaler_is_enabled(void);
 uint32_t vkpt_upscaler_get_scale(void);
 VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
-// The fence the command buffer carrying vkpt_upscaler_do()'s spatial pack
-// dispatch must signal, or VK_NULL_HANDLE when it carries none. It is what next
-// frame's inference waits on instead of draining the queue.
-VkFence vkpt_upscaler_pack_fence(void);
-// Drops any tensor the spatial upscaler has in flight. Must be called on frames
-// that skip vkpt_upscaler_final_blit(), which is what would otherwise consume it.
+// The fence the command buffer carrying vkpt_upscaler_do()'s transfer into the
+// input tensor must signal, or VK_NULL_HANDLE when it carries none. It is what
+// next frame's inference waits on instead of draining the queue.
+VkFence vkpt_upscaler_download_fence(void);
+// Drops any tensor the upscaler has in flight. Must be called on frames that
+// skip vkpt_upscaler_final_blit(), which is what would otherwise consume it.
 void vkpt_upscaler_discard(void);
 
 VkResult vkpt_bloom_initialize(void);
