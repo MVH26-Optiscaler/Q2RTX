@@ -743,34 +743,6 @@ direction jitter. Default value is 2.
 | 0     | none                                                         |
 | 1     | temporal AA                                                  |
 | 2     | temporal upscaling (TAAU)                                    |
-| 3     | NSS Temporal (NPU)                                           |
-
-Value 3 selects Arm's Neural Super Sampling model and, like `flt_upscaling`, acts as a
-selector: it drives `flt_nss_enable` for you and deselects FSR. It lives here rather
-than in `flt_upscaling` because it reconstructs from frame history the way TAA and TAAU
-do, rather than upscaling each frame independently the way FSR and QuickSRNet do — it
-replaces the temporal AA stage rather than competing with the spatial upscalers.
-
-Because the two occupy different stages, **NSS and a QuickSRNet upscaler can both be
-on**. They then chain: NSS reconstructs the frame temporally at 2x, and the spatial
-model upscales that result, which the unpack pass downsamples to the display. This costs
-a second CPU/NPU round trip per frame on top of the first, and the spatial stage sees an
-input already at 2x the render extent, so its tile count is high — at 1080p the chain is
-about 136 serial inferences per frame. It is a quality configuration, not a playable one.
-See `flt_upscaler_max_tiles`.
-
-Note NSS does not replace TAA in the pipeline, only in the menu: it consumes TAA's
-output, because the path-traced frame is too noisy at these sample counts to hand to the
-network directly. In this mode TAAU runs at 1:1 (so it behaves as plain TAA, with
-jitter) and NSS performs the reconstruction.
-
-This cvar is not archived, so it is not written to your config directly; the NSS
-selection persists through `flt_nss_enable`, which is.
-
-#### `flt_nss_enable`
-Whether the NSS temporal model is loaded, 0 or 1. Default value is 0. Normally driven by
-`flt_taa` rather than set directly. It is a separate cvar from `flt_upscaler_enable`
-precisely so the temporal and spatial models can be loaded at the same time.
 
 #### `flt_fsr_enable`
 Enables FidelityFX Super Resolution 1.0 ("AMD FSR 1.0") upscaling. Default value is 0.
@@ -796,9 +768,9 @@ Individual control of the upscaling and sharpening steps of FSR. Both default to
 Intended for testing purposes.
 
 #### `flt_upscaling`
-Selects the *spatial* upscaler shown in the video settings menu. The upscalers are
-mutually exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable`
-for you. Default value is 0.
+Selects the upscaler shown in the video settings menu. The upscalers are mutually
+exclusive, so setting this drives `flt_fsr_enable` and `flt_upscaler_enable` for you.
+Default value is 0.
 | Value | Upscaler                       |
 | ----- | ------------------------------ |
 | 0     | none                           |
@@ -806,9 +778,6 @@ for you. Default value is 0.
 | 2     | QuickSRNet Small               |
 | 3     | QuickSRNet Large               |
 | 4     | QuickSRNet Large (Q2RTX-tuned) |
-
-The temporal NSS model is not in this list; it is selected with `flt_taa 3`. The two are
-independent — see `flt_taa` for what happens when both are on.
 
 A QuickSRNet model's scale factor is a property of the model, not a resolution policy:
 `viewsize` and the dynamic resolution scaling cvars choose the render extent exactly as
@@ -826,21 +795,13 @@ count — and with it the number of serial NPU inferences — grows with the squ
 
 #### `flt_upscaler_enable`
 Selects which NPU (AI) upscaler model to run: 0 disables it, 1 is QuickSRNetSmall,
-2 is QuickSRNetLarge, 3 is a QuickSRNetLarge fine-tuned on Quake II RTX frames (which
+2 is QuickSRNetLarge, and 3 is a QuickSRNetLarge fine-tuned on Quake II RTX frames (which
 trades generality for sharper results on this game's content at the same cost as the
-stock Large model). Default value is 0. Normally driven by `flt_upscaling` rather than
-set directly. The NSS Temporal model is not selectable here — it has its own slot,
-`flt_nss_enable`; an archived config naming it is migrated on startup.
+stock Large model). Default value is 0. Normally driven by `flt_upscaling` rather than set
+directly.
 
-NSS Temporal (Arm's Neural Super Sampling) is a different kind of model from the
-QuickSRNet family: rather than a stateless spatial upscale, it consumes motion vectors,
-depth and its own cross-frame feedback to reconstruct the frame with temporal
-accumulation, similar in spirit to DLSS/FSR2. That is why it is selected from `flt_taa`
-alongside the other temporal modes. It was exported at one fixed shape (see
-`baseq2/models/nss-temporal-high-int8.metadata.json`), so unlike the QuickSRNet models
-its render resolution is entirely fixed and `viewsize`/DRS have no effect on it at all.
-It targets a roughly 1080p-class display; on very different display resolutions its
-quality degrades gracefully but was not tuned for that case.
+Models must be square fixed-shape 3-channel NCHW with an integer scale factor; anything
+else is rejected at load time rather than rendered as garbage.
 
 Requires a build with `USE_ORT_QNN_UPSCALER` (Windows on ARM64, i.e. Snapdragon). The
 models themselves ship in `baseq2/models`. If a model file is missing or the QNN

@@ -2291,16 +2291,6 @@ LIST_IMAGES_A_B
 	img_info[VKPT_IMG_ASVGF_TAA_A].sampler = qvk.tex_sampler;
 	img_info[VKPT_IMG_ASVGF_TAA_B].sampler = qvk.tex_sampler;
 	img_info[VKPT_IMG_TAA_OUTPUT].sampler = qvk.tex_sampler;
-	// NSS temporal upscaler: both read with bilinear/Catmull-Rom texture() taps
-	// (reprojected derivative history, reprojected history colour), not
-	// texelFetch, so they need the same linear sampler as the existing TAA
-	// history buffers rather than the nearest sampler every other framebuffer
-	// image defaults to above. The network's own feedback tensor has no image
-	// here at all -- see global_textures.h's NSS comment.
-	img_info[VKPT_IMG_NSS_LUMA_DERIV_A].sampler = qvk.tex_sampler;
-	img_info[VKPT_IMG_NSS_LUMA_DERIV_B].sampler = qvk.tex_sampler;
-	img_info[VKPT_IMG_NSS_HISTORY_COLOR_A].sampler = qvk.tex_sampler;
-	img_info[VKPT_IMG_NSS_HISTORY_COLOR_B].sampler = qvk.tex_sampler;
 
 	VkWriteDescriptorSet output_img_write[NUM_IMAGES * 2];
 
@@ -2385,26 +2375,10 @@ LIST_IMAGES_A_B
 	// to contain, an alpha of 1 erases the entire 3D view and replaces it with
 	// lines.rgb. Nothing else in the renderer ever writes it, so clear it here,
 	// once, right after the layout transition above.
-	//
-	// The NSS temporal upscaler's history images are the same class of bug:
-	// nss_reconstruct.comp samples IMG_NSS_HISTORY_COLOR_B/IMG_NSS_LUMA_DERIV_B
-	// unconditionally (even off-screen, where it is only clamped afterward, not
-	// skipped), so freshly (re)allocated device memory read as history before
-	// anything has ever written a real frame into it can read as structured
-	// garbage from whatever this VRAM held previously -- including NaNs, which
-	// clamp()/mix() do not reliably scrub. Clearing them here, at the same
-	// point images go from UNDEFINED to a defined layout, guarantees a clean
-	// zero state (which the shaders already treat as "no history yet", the
-	// same state disocclusion resets to every frame after) rather than relying
-	// on however many frames it takes real content to overwrite the garbage.
 	{
 		const VkClearColorValue clear_color = { .float32 = { 0.f, 0.f, 0.f, 0.f } };
 		VkImage clear_images[] = {
 			qvk.images[VKPT_IMG_CLEAR],
-			qvk.images[VKPT_IMG_NSS_HISTORY_COLOR_A],
-			qvk.images[VKPT_IMG_NSS_HISTORY_COLOR_B],
-			qvk.images[VKPT_IMG_NSS_LUMA_DERIV_A],
-			qvk.images[VKPT_IMG_NSS_LUMA_DERIV_B],
 		};
 		for (size_t i = 0; i < LENGTH(clear_images); i++) {
 			vkCmdClearColorImage(cmd_buf, clear_images[i],

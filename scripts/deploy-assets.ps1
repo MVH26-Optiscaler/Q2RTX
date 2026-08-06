@@ -59,10 +59,8 @@
     that script fetches the TFLite variants because it targets USE_LITE_RT, while
     upscaler.c on this branch loads ONNX.
 
-    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) and the NSS temporal model
-    (flt_taa 3) are skipped: neither has an upstream zip to fetch (the former is
-    fine-tuned locally, the latter comes from a separate Arm checkout, not QAI Hub), so
-    the repo is their only source.
+    The Q2RTX-tuned QuickSRNetLarge (flt_upscaling 4) is skipped: it has no upstream
+    zip to fetch (it is fine-tuned locally), so the repo is its only source.
 
     Note the rename asymmetry, which is what makes this fiddly to do by hand: each zip
     ships e.g. quicksrnetsmall.onnx + quicksrnetsmall.data, and the model must be
@@ -124,9 +122,7 @@ $Baseq2   = Join-Path $RepoRoot "baseq2"
 #
 # Onnx is the filename upscaler.c loads relative to the game dir and Selector is the
 # console setting that picks it; both come from upscaler_models[] in
-# src/refresh/vkpt/upscaler.c and must stay in step with it. The spatial models are
-# selected from flt_upscaling, the temporal one from flt_taa -- see the menu-selector
-# comments in upscaler.c.
+# src/refresh/vkpt/upscaler.c and must stay in step with it.
 $QaiHubBaseUrl  = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/{0}/releases/v0.57.3"
 $UpscalerModels = @(
     @{
@@ -147,12 +143,6 @@ $UpscalerModels = @(
         Id       = "quicksrnetlarge-q2rtx"
         Onnx     = "quicksrnetlarge-q2rtx-w8a8.onnx"
         Selector = "flt_upscaling 4"
-        Bundled  = $true
-    },
-    @{
-        Id       = "nss-temporal-high"
-        Onnx     = "nss-temporal-high-int8.onnx"
-        Selector = "flt_taa 3"
         Bundled  = $true
     }
 )

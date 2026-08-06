@@ -102,8 +102,6 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	SHADER_MODULE_DO(QVK_MOD_FSR_RCAS_FP32_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_UPSCALER_PACK_COMP)                     \
 	SHADER_MODULE_DO(QVK_MOD_UPSCALER_UNPACK_COMP)                   \
-	SHADER_MODULE_DO(QVK_MOD_NSS_PACK_COMP)                          \
-	SHADER_MODULE_DO(QVK_MOD_NSS_RECONSTRUCT_COMP)                   \
 	SHADER_MODULE_DO(QVK_MOD_NORMALIZE_NORMAL_MAP_COMP)              \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_FRAG)                        \
 	SHADER_MODULE_DO(QVK_MOD_DEBUG_LINE_VERT)                        \
@@ -716,17 +714,15 @@ bool vkpt_upscaler_is_enabled(void);
 // The loaded model's integer scale factor, or 0 when the upscaler will not run.
 // The render extent is derived from it; see get_render_extent() in main.c.
 uint32_t vkpt_upscaler_get_scale(void);
-// True and filled in when the loaded model is the NSS temporal kind, which --
-// unlike the spatial (QuickSRNet) models -- has a single fixed input shape
-// and cannot tile or crop to an arbitrary viewsize-driven render extent. When
-// this returns true, get_render_extent() in main.c must use *out verbatim
-// instead of its usual viewsize/DRS-derived size.
-bool vkpt_upscaler_get_temporal_extent(VkExtent2D *out);
 VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
-// Must be called after the command buffer holding vkpt_upscaler_do()'s pack
-// dispatch has been submitted, and before vkpt_upscaler_final_blit().
-VkResult vkpt_upscaler_run_inference(void);
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
+// The fence the command buffer carrying vkpt_upscaler_do()'s spatial pack
+// dispatch must signal, or VK_NULL_HANDLE when it carries none. It is what next
+// frame's inference waits on instead of draining the queue.
+VkFence vkpt_upscaler_pack_fence(void);
+// Drops any tensor the spatial upscaler has in flight. Must be called on frames
+// that skip vkpt_upscaler_final_blit(), which is what would otherwise consume it.
+void vkpt_upscaler_discard(void);
 
 VkResult vkpt_bloom_initialize(void);
 VkResult vkpt_bloom_destroy(void);

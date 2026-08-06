@@ -48,7 +48,6 @@ layout(push_constant) uniform PushConstants {
 	uint tile_out; // model output edge, pixels
 	uint src_width;   // rect of the source image the pack pass read
 	uint src_height;
-	uint src_is_nss;  // unused here; see upscaler_pack.comp
 } push;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;

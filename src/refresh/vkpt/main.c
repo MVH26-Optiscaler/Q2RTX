@@ -250,15 +250,6 @@ static bool upscaler_active_this_frame(void)
 
 static VkExtent2D get_render_extent(void)
 {
-	// The NSS temporal upscaler was exported at one fixed input shape (see
-	// nss-temporal-high-int8.onnx / tools/export_onnx_int8.py in the
-	// neural-super-sampling checkout), unlike the spatial QuickSRNet models,
-	// which tile and box-filter to absorb whatever viewsize/DRS hands them.
-	// While NSS is loaded, viewsize/DRS have no effect on render resolution.
-	VkExtent2D temporal_extent;
-	if (vkpt_upscaler_get_temporal_extent(&temporal_extent))
-		return temporal_extent;
-
 	int scale;
 	if(drs_effective_scale)
 	{
@@ -301,19 +292,6 @@ static VkExtent2D get_screen_image_extent(void)
 	{
 		result.width = max(qvk.extent_render.width, qvk.extent_unscaled.width);
 		result.height = max(qvk.extent_render.height, qvk.extent_unscaled.height);
-	}
-
-	// NSS's reconstruct pass writes a corner sub-rect sized at its model's
-	// true output extent (render extent at an exact 2x scale -- see
-	// nss_reconstruct.comp's header), which can exceed qvk.extent_unscaled
-	// when the real window/display is smaller than that (e.g. a windowed
-	// client below ~1920x1088). Floor unconditionally so IMG_WIDTH/HEIGHT is
-	// always big enough for that write, regardless of which branch above ran.
-	VkExtent2D nss_extent;
-	if (vkpt_upscaler_get_temporal_extent(&nss_extent))
-	{
-		result.width = max(result.width, nss_extent.width * 2);
-		result.height = max(result.height, nss_extent.height * 2);
 	}
 
 	result.width = (result.width + 1) & ~1;
@@ -2671,17 +2649,6 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 
 	int flt_taa = cvar_flt_taa->integer;
 
-	// AA_MODE_NSS selects the NSS temporal upscaler, which is not an alternative
-	// to TAA but a consumer of it: nss_pack.comp reads TEX_TAA_OUTPUT, and it
-	// wants the jitter-resolved frame, so the mode it really needs underneath is
-	// AA_MODE_UPSCALE. The pin at the bottom of this function then holds TAAU to
-	// 1:1 and leaves the actual upscaling to the network.
-	bool nss_selected = (flt_taa == AA_MODE_NSS);
-	if (nss_selected)
-	{
-		flt_taa = AA_MODE_UPSCALE;
-	}
-
 	// FSR RCAS needs upscaled input; if EASU was disabled, force to TAAU
 	bool force_upscaling = vkpt_fsr_is_enabled() && vkpt_fsr_needs_upscale();
 	if(force_upscaling)
@@ -2697,12 +2664,8 @@ evaluate_taa_settings(const reference_mode_t* ref_mode)
 	{
 		// Dropping to plain TAA here is for the case TAAU cannot serve, where the
 		// render extent already meets or exceeds the display so there is nothing
-		// to upsample. NSS is exempt: its render extent is the model's fixed one
-		// and can exceed a small window, but TAAU is pinned to 1:1 below either
-		// way, so the only thing this branch would change is turning the jitter
-		// off -- which starves the network of the samples it reconstructs from.
-		if (!nss_selected
-			&& (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height))
+		// to upsample.
+		if (qvk.extent_render.width > qvk.extent_unscaled.width || qvk.extent_render.height > qvk.extent_unscaled.height)
 		{
 			qvk.effective_aa_mode = AA_MODE_TAA;
 		}
@@ -3414,12 +3377,12 @@ R_RenderFrame_RTX(refdef_t *fd)
 
 		_VK(vkpt_profiler_query(post_cmd_buf, PROFILER_FRAME_TIME, PROFILER_STOP));
 
-		vkpt_submit_command_buffer_simple(post_cmd_buf, qvk.queue_graphics, true);
-
-		// The NPU runs on the CPU's side of the fence: the pack dispatch above
-		// has to complete before the tensor can be read, and the unpack pass in
-		// vkpt_upscaler_final_blit() needs the result. Hence a stall here.
-		vkpt_upscaler_run_inference();
+		// Signals the spatial upscaler's pack fence when the pack dispatch above
+		// went into this command buffer, so next frame's inference can tell the
+		// tensor is ready without draining the queue. VK_NULL_HANDLE otherwise,
+		// which is exactly what vkpt_submit_command_buffer_simple() would pass.
+		vkpt_submit_command_buffer(post_cmd_buf, qvk.queue_graphics, (1 << qvk.device_count) - 1,
+			0, NULL, NULL, NULL, 0, NULL, NULL, vkpt_upscaler_pack_fence());
 	}
 
 	temporal_frame_valid = ref_mode.enable_denoiser;
@@ -3711,10 +3674,20 @@ R_EndFrame_RTX(void)
 
 	VkCommandBuffer cmd_buf = vkpt_begin_command_buffer(&qvk.cmd_buffers_graphics);
 
+	bool upscaler_blits_this_frame = frame_ready && upscaler_active_this_frame() && !qvk.frame_menu_mode;
+
+	// The NPU upscaler's round trip spans two frames, and its unpack lives in the
+	// blit below. On any frame that does not reach that blit nothing will consume
+	// what it packed, so drop it: a tensor left pending would otherwise resurface
+	// a frame late, possibly after its staging buffers were rebuilt at a
+	// different tile grid.
+	if (!upscaler_blits_this_frame)
+		vkpt_upscaler_discard();
+
 	if (frame_ready)
 	{
 		bool waterwarp = (vkpt_refdef.fd->rdflags & RDF_UNDERWATER) && cvar_pt_waterwarp->integer;
-		if (upscaler_active_this_frame() && !qvk.frame_menu_mode)
+		if (upscaler_blits_this_frame)
 		{
 			vkpt_upscaler_final_blit(cmd_buf, waterwarp);
 		}
