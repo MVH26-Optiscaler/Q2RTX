@@ -24,7 +24,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	Qualcomm QNN Execution Provider, so inference dispatches to the Hexagon NPU
 	on Windows-ARM64 (Snapdragon) devices.
 
-	Per frame the tone-mapped TAA output is blitted into an R8G8B8A8_UNORM image
+	Per frame the tone-mapped TAA output is blitted into an R8G8B8A8_SRGB image
 	and copied straight into the model's input tensor; the CPU runs one inference
 	for the whole frame on the NPU; the result is copied straight back into an
 	image the final blit samples. The GPU->NPU->GPU round trip is a hard pipeline
@@ -33,10 +33,20 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 	No pack/unpack shaders
 	----------------------
 	The models take and return uint8 NHWC RGBA -- 1 x H x W x 4, which is
-	byte-for-byte a tightly packed R8G8B8A8_UNORM image. So the transfer in each
+	byte-for-byte a tightly packed 8-bit RGBA image. So the transfer in each
 	direction is one vkCmdCopyImageToBuffer / vkCmdCopyBufferToImage with no
-	shader in between, and the float->unorm8 conversion and [0,1] clamp fall out
-	of the blit that feeds it.
+	shader in between, and the float->unorm8 conversion, the [0,1] clamp and the
+	linear->sRGB encode all fall out of the blit that feeds it.
+
+	Colour space
+	------------
+	Tone mapping leaves TAA_OUTPUT linear: it clamps to [0,1] and dithers for an
+	8-bit sRGB quantization, but the sRGB encode itself is the hardware's, applied
+	when the final blit writes the (always sRGB) swapchain view. Quantizing that
+	linear signal to 8 bits for the tensor would hand the model a transfer
+	function it was never trained on and spend half the code words on highlights,
+	so the round-trip images are sRGB instead and the hardware encodes on the way
+	in and decodes on the way out. See create_ldr_image().
 
 	Models as trained are NCHW; scripts/onnx-nhwc-io.py wraps their graph I/O in a
 	pair of Transpose nodes to move the declared layout, which ONNX Runtime's
@@ -108,11 +118,11 @@ cvar_t *cvar_flt_upscaling = NULL;
 // frames, quantized to w8a8 and re-exported with uint8 NHWC RGBA I/O and free
 // H/W dimensions.
 //
-// The scale factor is declared here rather than discovered, because the render
-// extent depends on it (get_render_extent() consults vkpt_upscaler_get_scale())
-// and is therefore needed before a session exists to ask. It is not taken on
-// trust: load_session() runs one inference and refuses the model if what comes
-// back is not this factor.
+// The scale factor is declared here rather than discovered, because the frame
+// graph has to settle whether the upscaler is in it -- upscaler_active_this_frame()
+// in main.c keys off vkpt_upscaler_get_scale() -- before there is a session to
+// ask. It is not taken on trust: load_session() runs one inference and refuses
+// the model if what comes back is not this factor.
 //
 // Order matters: it defines both the flt_upscaler_enable values and the
 // flt_upscaling values below, so append rather than insert.
@@ -207,10 +217,11 @@ void vkpt_upscaler_init_cvars(void)
 // down the viewsize slider -- must not queue one up per frame.
 #define UPSCALER_REBUILD_INTERVAL_MS 1000
 
-// One R8G8B8A8_UNORM image the transfer commands work against. These are not
-// VKPT_IMG_* screen images: the output one is the render extent times the model
-// scale, which at viewsize 100 with a 4x model is four times the extent
-// get_screen_image_extent() allocates.
+// One 8-bit RGBA image the transfer commands work against, sRGB where the device
+// allows it -- see create_ldr_image(). These are not VKPT_IMG_* screen images:
+// the output one is the render extent times the model scale, which at viewsize
+// 100 with a 4x model is four times the extent get_screen_image_extent()
+// allocates.
 typedef struct {
 	VkImage        image;
 	VkImageView    view;
@@ -277,20 +288,42 @@ struct
 	bool             ready; // fences are up; the pass may be recorded
 	upscaler_slot_t  slots[MAX_FRAMES_IN_FLIGHT];
 
+	// Format of img_in/img_out, chosen once by pick_ldr_format(). Normally
+	// R8G8B8A8_SRGB so the hardware does the transfer-function conversion; falls
+	// back to R8G8B8A8_UNORM on a device that cannot blit into sRGB.
+	VkFormat         ldr_format;
+
 	// One-shot flag set by the upscaler_dump console command, captured into the
 	// slot by spatial_download() so the pre/post pair covers the same frame.
 	bool             dump_requested;
 
 	// Rolling cost of the NPU round trip. Accumulated over many frames because
-	// Sys_Milliseconds() is far too coarse to time a single frame's inference.
-	// wait_ms_accum is the download_fence wait alone -- what is left of the old
-	// vkQueueWaitIdle stall now that the round trip is pipelined.
+	// Sys_Milliseconds() truncates to whole milliseconds: a single sample carries
+	// +-1 ms, but the tick phase is uncorrelated with the frame loop so the
+	// average over UPSCALER_TIMING_INTERVAL frames converges.
+	//
+	// Only ever covers one model at one extent: reset_timing() clears these
+	// whenever the session is torn down, which is the only way either can change.
+	// Without that an interval straddling a switch would average two
+	// configurations and report the result under whichever one happened to be
+	// current at the end.
+	//
+	// stall_ms_accum is the wait on the previous frame's download_fence. That
+	// fence is signalled by that frame's whole post submit, so it measures how far
+	// the GPU is behind -- not the cost of the download transfer itself.
 	unsigned         inference_ms_accum;
-	unsigned         wait_ms_accum;
+	unsigned         stall_ms_accum;
 	unsigned         inference_frames;
 } upscaler;
 
 #define UPSCALER_TIMING_INTERVAL 100 // frames between timing reports
+
+static void reset_timing(void)
+{
+	upscaler.inference_ms_accum = 0;
+	upscaler.stall_ms_accum = 0;
+	upscaler.inference_frames = 0;
+}
 
 static inline bool upscaler_extents_equal(VkExtent2D a, VkExtent2D b)
 {
@@ -513,6 +546,10 @@ done:
 // command via spatial_run_inference(). The tensor is interleaved RGBA8 already,
 // so this is a straight write -- a dump that comes out as horizontal colour
 // bands means an NCHW model slipped past load_session().
+//
+// The bytes are sRGB-encoded (see create_ldr_image()), which is what PNG means
+// by 8-bit colour, so the dumps are directly comparable to a screenshot. A dump
+// that looks uniformly too dark means the round trip fell back to linear.
 static void upscaler_dump_tensor(const char *stage, const uint8_t *rgba, VkExtent2D extent)
 {
 	char path[MAX_OSPATH];
@@ -689,6 +726,13 @@ static void unload_session(void)
 		vkDeviceWaitIdle(qvk.device);
 	destroy_slots();
 
+	// Whatever has been accumulated describes the session being torn down. This
+	// is the choke point for every change that matters -- a different model, or a
+	// different render extent, both of which can only take effect through a
+	// rebuild -- so clearing here is what keeps a reported average describing one
+	// configuration rather than a blend of two.
+	reset_timing();
+
 	upscaler.session_ready = false;
 	upscaler.session_extent = (VkExtent2D){ 0, 0 };
 	upscaler.input_byte_size = 0;
@@ -799,9 +843,40 @@ static void upscaler_model_changed(cvar_t *self)
 	upscaler_reload_model();
 }
 
+// The transfer function the model round trip runs in. R8G8B8A8_SRGB gets the
+// encode and the decode for free from the hardware -- see the comment on
+// create_ldr_image() for why that is the correct domain -- but sRGB is not a
+// mandatory blit destination, and img_in is a blit destination. Fall back to
+// UNORM rather than failing: that is what this pass did before, so the
+// resulting image is the older, worse one rather than no image at all.
+static VkFormat pick_ldr_format(void)
+{
+	const VkFormatFeatureFlags required =
+		  VK_FORMAT_FEATURE_BLIT_DST_BIT              // img_in: blitted into
+		| VK_FORMAT_FEATURE_TRANSFER_SRC_BIT          // img_in: copied to buffer
+		| VK_FORMAT_FEATURE_TRANSFER_DST_BIT          // img_out: copied from buffer
+		| VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT         // img_out: sampled by the final blit
+		| VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+
+	VkFormatProperties props;
+	vkGetPhysicalDeviceFormatProperties(qvk.physical_device, VK_FORMAT_R8G8B8A8_SRGB, &props);
+
+	if ((props.optimalTilingFeatures & required) == required)
+		return VK_FORMAT_R8G8B8A8_SRGB;
+
+	Com_WPrintf("upscaler: R8G8B8A8_SRGB is not usable for the model round trip on this "
+		"device; running it in linear space instead, which is not what the model was "
+		"trained on\n");
+	return VK_FORMAT_R8G8B8A8_UNORM;
+}
+
 VkResult vkpt_upscaler_initialize(void)
 {
 	memset(&upscaler, 0, sizeof(upscaler));
+
+	// Before any early return below: create_ldr_image() reads this
+	// unconditionally, and VK_FORMAT_UNDEFINED from the memset would be invalid.
+	upscaler.ldr_format = pick_ldr_format();
 
 	upscaler.api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 	if (!upscaler.api) {
@@ -880,12 +955,22 @@ static void destroy_ldr_image(upscaler_image_t *img)
 	img->extent = (VkExtent2D){ 0, 0 };
 }
 
+// The sRGB format is what puts the model in its training domain, and it costs
+// nothing: the blit that fills img_in converts linear -> sRGB as part of its
+// format conversion, and the sampler on img_out converts back on the way to the
+// final blit, which owes the swapchain linear. The two cancel, so the displayed
+// image is unchanged; what changes is that the 8 bits the tensor carries are
+// spent perceptually rather than linearly.
+//
+// The copies in between are untouched by this: vkCmdCopyImageToBuffer and
+// vkCmdCopyBufferToImage move raw bytes and never convert, which is exactly
+// what the tensor wants.
 static bool create_ldr_image(upscaler_image_t *img, VkExtent2D extent, const char *name)
 {
 	VkImageCreateInfo image_info = {
 		.sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.imageType             = VK_IMAGE_TYPE_2D,
-		.format                = VK_FORMAT_R8G8B8A8_UNORM,
+		.format                = upscaler.ldr_format,
 		.extent                = { extent.width, extent.height, 1 },
 		.mipLevels             = 1,
 		.arrayLayers           = 1,
@@ -923,7 +1008,7 @@ static bool create_ldr_image(upscaler_image_t *img, VkExtent2D extent, const cha
 		.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		.image            = img->image,
 		.viewType         = VK_IMAGE_VIEW_TYPE_2D,
-		.format           = VK_FORMAT_R8G8B8A8_UNORM,
+		.format           = upscaler.ldr_format,
 		.subresourceRange = {
 			.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
 			.baseMipLevel   = 0, .levelCount = 1,
@@ -1046,6 +1131,7 @@ VkResult vkpt_upscaler_create_pipelines(void)
 VkResult vkpt_upscaler_destroy_pipelines(void)
 {
 	destroy_slots();
+	reset_timing();
 
 	upscaler.ready = false;
 
@@ -1264,20 +1350,24 @@ static VkResult spatial_run_inference(upscaler_slot_t *slot)
 	bool dump = slot->dump;
 	slot->dump = false;
 
-	unsigned wait_begin = Sys_Milliseconds();
+	unsigned stall_begin = Sys_Milliseconds();
 
 	_VK(vkWaitForFences(qvk.device, 1, &slot->download_fence, VK_TRUE, ~((uint64_t)0)));
 	slot->fence_pending = false;
 
-	unsigned time_begin = Sys_Milliseconds();
+	unsigned stall_end = Sys_Milliseconds();
 
 	// The session can have been rebuilt at a different extent between the
 	// download and now, which leaves this tensor the wrong size for it.
 	if (!upscaler.session_ready || !upscaler_extents_equal(slot->extent_in, upscaler.session_extent))
 		return VK_SUCCESS;
 
+	// Outside the timed region below: writing a multi-megabyte PNG dwarfs the
+	// inference and would otherwise land entirely in this frame's sample.
 	if (dump)
 		upscaler_dump_tensor("pre", (const uint8_t *)slot->input_mapped, slot->extent_in);
+
+	unsigned infer_begin = Sys_Milliseconds();
 
 	const char *input_names[]  = { UPSCALER_INPUT_NAME };
 	const char *output_names[] = { UPSCALER_OUTPUT_NAME };
@@ -1305,22 +1395,29 @@ static VkResult spatial_run_inference(upscaler_slot_t *slot)
 	if (output_value)
 		upscaler.api->ReleaseValue(output_value);
 
+	// The ORT tensor create/release pairs above are inside the measurement on
+	// purpose -- they are real per-frame CPU cost, and they are what the game
+	// reads above a bare Run() benchmark.
+	unsigned infer_end = Sys_Milliseconds();
+
 	if (dump && slot->tensor_valid)
 		upscaler_dump_tensor("post", (const uint8_t *)slot->output_mapped, slot->extent_out);
 
-	upscaler.wait_ms_accum += time_begin - wait_begin;
-	upscaler.inference_ms_accum += Sys_Milliseconds() - time_begin;
+	upscaler.stall_ms_accum += stall_end - stall_begin;
+	upscaler.inference_ms_accum += infer_end - infer_begin;
 	upscaler.inference_frames++;
 
 	if (upscaler.inference_frames >= UPSCALER_TIMING_INTERVAL)
 	{
-		Com_Printf("upscaler: %.2f ms/frame inference at %ux%u, %.2f ms/frame waiting on the download\n",
-			(double)upscaler.inference_ms_accum / upscaler.inference_frames,
+		// Naming the model as well as the extent: reset_timing() guarantees every
+		// sample in this average came from one session, so the label is exact.
+		Com_Printf("upscaler: %s at %ux%u: %.2f ms/frame inference, "
+			"%.2f ms/frame blocked on the previous frame's GPU work\n",
+			upscaler_models[upscaler.selected_model - 1].name,
 			slot->extent_in.width, slot->extent_in.height,
-			(double)upscaler.wait_ms_accum / upscaler.inference_frames);
-		upscaler.inference_ms_accum = 0;
-		upscaler.wait_ms_accum = 0;
-		upscaler.inference_frames = 0;
+			(double)upscaler.inference_ms_accum / upscaler.inference_frames,
+			(double)upscaler.stall_ms_accum / upscaler.inference_frames);
+		reset_timing();
 	}
 
 	return VK_SUCCESS;

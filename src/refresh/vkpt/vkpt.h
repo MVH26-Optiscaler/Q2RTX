@@ -711,7 +711,9 @@ VkResult vkpt_upscaler_create_pipelines(void);
 VkResult vkpt_upscaler_destroy_pipelines(void);
 bool vkpt_upscaler_is_enabled(void);
 // The loaded model's integer scale factor, or 0 when the upscaler will not run.
-// The render extent is derived from it; see get_render_extent() in main.c.
+// It does not influence the render extent -- viewsize/DRS pick that -- but it is
+// how the frame graph decides whether the upscaler is in it; see
+// upscaler_active_this_frame() in main.c.
 uint32_t vkpt_upscaler_get_scale(void);
 VkResult vkpt_upscaler_do(VkCommandBuffer cmd_buf);
 VkResult vkpt_upscaler_final_blit(VkCommandBuffer cmd_buf, bool warp);
